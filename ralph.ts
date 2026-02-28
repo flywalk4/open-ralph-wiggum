@@ -28,12 +28,12 @@ const questionsPath = join(stateDir, "ralph-questions.json");
 let customConfigPath = "";
 let initConfigPath = "";
 
-const AGENT_TYPES = ["opencode", "claude-code", "codex", "copilot"] as const;
+const AGENT_TYPES = ["opencode", "claude-code", "codex", "copilot", "aider"] as const;
 type AgentType = (typeof AGENT_TYPES)[number];
 
-type AgentEnvOptions = { filterPlugins?: boolean; allowAllPermissions?: boolean };
+type AgentEnvOptions = { filterPlugins?: boolean; allowAllPermissions?: boolean; baseUrl?: string };
 
-type AgentBuildArgsOptions = { allowAllPermissions?: boolean; extraFlags?: string[]; streamOutput?: boolean };
+type AgentBuildArgsOptions = { allowAllPermissions?: boolean; extraFlags?: string[]; streamOutput?: boolean; baseUrl?: string };
 
 interface AgentConfig {
   type: AgentType;
@@ -77,6 +77,11 @@ const PARSE_PATTERNS: Record<string, (line: string) => string | null> = {
   },
   "codex": null,
   "copilot": null,
+  "aider": (line) => {
+    const clean = stripAnsi(line);
+    const match = clean.match(/^(?:Applied edit|Wrote|Created|Updated)\s+(.+)/i);
+    return match ? match[1] : null;
+  },
   "default": (line) => {
     const match = stripAnsi(line).match(/(?:Tool:|Using|Called|Running)\s+([A-Za-z0-9_-]+)/i);
     return match ? match[1] : null;
@@ -122,6 +127,14 @@ const ARGS_TEMPLATES: Record<string, (prompt: string, model: string, options?: A
     if (options?.extraFlags?.length) cmdArgs.push(...options.extraFlags);
     return cmdArgs;
   },
+  "aider": (prompt, model, options) => {
+    const cmdArgs = ["--message", prompt];
+    if (model) cmdArgs.push("--model", model);
+    if (options?.baseUrl) cmdArgs.push("--openai-api-base", options.baseUrl);
+    if (options?.allowAllPermissions) cmdArgs.push("--yes");
+    if (options?.extraFlags?.length) cmdArgs.push(...options.extraFlags);
+    return cmdArgs;
+  },
   "default": (prompt, model, options) => {
     const cmdArgs: string[] = [];
     if (model) cmdArgs.push("--model", model);
@@ -141,6 +154,13 @@ const ENV_TEMPLATES: Record<string, (options: AgentEnvOptions) => Record<string,
         allowAllPermissions: options.allowAllPermissions,
       });
     }
+    return env;
+  },
+  "aider": (options) => {
+    const env: Record<string, string> = { ...process.env };
+    // Aider requires OPENAI_API_KEY to be set; use a placeholder for local models
+    if (!env.OPENAI_API_KEY) env.OPENAI_API_KEY = "local";
+    if (options.baseUrl) env.OPENAI_API_BASE = options.baseUrl;
     return env;
   },
   "default": () => ({ ...process.env }),
@@ -189,6 +209,7 @@ function getDefaultConfig(): RalphConfig {
       { type: "claude-code", command: "claude", configName: "Claude Code", argsTemplate: "claude-code", envTemplate: "default", parsePattern: "claude-code" },
       { type: "codex", command: "codex", configName: "Codex", argsTemplate: "codex", envTemplate: "default", parsePattern: "codex" },
       { type: "copilot", command: "copilot", configName: "Copilot CLI", argsTemplate: "copilot", envTemplate: "default", parsePattern: "copilot" },
+      { type: "aider", command: "aider", configName: "Aider", argsTemplate: "aider", envTemplate: "aider", parsePattern: "aider" },
     ],
   };
 }
@@ -247,6 +268,14 @@ const BUILT_IN_AGENTS: Record<AgentType, AgentConfig> = {
     parseToolOutput: PARSE_PATTERNS["copilot"],
     configName: "Copilot CLI",
   },
+  "aider": {
+    type: "aider",
+    command: resolveCommand("aider", process.env.RALPH_AIDER_BINARY),
+    buildArgs: ARGS_TEMPLATES["aider"],
+    buildEnv: ENV_TEMPLATES["aider"],
+    parseToolOutput: PARSE_PATTERNS["aider"],
+    configName: "Aider",
+  },
 };
 
 // Parse arguments early for --config and --init-config handling
@@ -298,7 +327,7 @@ Arguments:
   prompt              Task description for the AI to work on
 
 Options:
-  --agent AGENT       AI agent to use: opencode (default), claude-code, codex, copilot
+  --agent AGENT       AI agent to use: opencode (default), claude-code, codex, copilot, aider
   --min-iterations N  Minimum iterations before completion allowed (default: 1)
   --max-iterations N  Maximum iterations before stopping (default: unlimited)
   --completion-promise TEXT  Phrase that signals completion (default: COMPLETE)
@@ -306,9 +335,10 @@ Options:
   --tasks, -t         Enable Tasks Mode for structured task tracking
   --task-promise TEXT Phrase that signals task completion (default: READY_FOR_NEXT_TASK)
   --model MODEL       Model to use (agent-specific, e.g., anthropic/claude-sonnet)
+  --base-url URL      Base URL for OpenAI-compatible APIs (e.g., http://localhost:11434/v1 for Ollama)
   --rotation LIST     Agent/model rotation for each iteration (comma-separated)
                       Each entry must be "agent:model" format
-                      Valid agents: opencode, claude-code, codex
+                      Valid agents: opencode, claude-code, codex, aider
                       Example: --rotation "opencode:claude-sonnet-4,claude-code:gpt-4o"
                       When used, --agent and --model are ignored
   --prompt-file, --file, -f  Read prompt content from a file
@@ -345,6 +375,7 @@ Examples:
   ralph --status                                        # Check loop status
   ralph --add-context "Focus on the auth module first"  # Add hint for next iteration
   ralph "Build API" -- --agent build                    # Pass flags to the agent
+  ralph "Fix the bug" --agent aider --model ollama/qwen2.5-coder --base-url http://localhost:11434/v1
 
 How it works:
   1. Sends your prompt to the selected AI agent
@@ -451,6 +482,7 @@ if (args.includes("--status")) {
       const agentLabel = state.agent ? (AGENTS[state.agent]?.configName ?? state.agent) : "OpenCode";
       console.log(`   Agent:        ${agentLabel}`);
       if (state.model) console.log(`   Model:        ${state.model}`);
+      if (state.baseUrl) console.log(`   Base URL:     ${state.baseUrl}`);
     }
     if (state.tasksMode) {
       console.log(`   Tasks Mode:   ENABLED`);
@@ -829,6 +861,7 @@ let abortPromise = ""; // Optional abort promise for early exit on precondition 
 let tasksMode = false;
 let taskPromise = "READY_FOR_NEXT_TASK";
 let model = "";
+let baseUrl = "";
 let agentType: AgentType = "opencode";
 let rotationInput = "";
 let rotation: string[] | null = null;
@@ -940,6 +973,13 @@ for (let i = 0; i < args.length; i++) {
       process.exit(1);
     }
     model = val;
+  } else if (arg === "--base-url") {
+    const val = args[++i];
+    if (!val) {
+      console.error("Error: --base-url requires a URL");
+      process.exit(1);
+    }
+    baseUrl = val;
   } else if (arg === "--prompt-file" || arg === "--file" || arg === "-f") {
     const val = args[++i];
     if (!val) {
@@ -1057,6 +1097,7 @@ interface RalphState {
   promptTemplate?: string; // Custom prompt template path
   startedAt: string;
   model: string;
+  baseUrl?: string;
   agent: AgentType;
   rotation?: string[];
   rotationIndex?: number;
@@ -1850,6 +1891,7 @@ async function runRalphLoop(): Promise<void> {
     prompt = existingState.prompt;
     promptTemplatePath = existingState.promptTemplate ?? "";
     model = existingState.model;
+    baseUrl = existingState.baseUrl ?? "";
     agentType = existingState.agent;
     rotation = existingState.rotation ?? null;
     console.log(`🔄 Resuming Ralph loop from ${statePath}`);
@@ -1911,6 +1953,7 @@ async function runRalphLoop(): Promise<void> {
     promptTemplate: promptTemplatePath || undefined,
     startedAt: new Date().toISOString(),
     model: initialModel,
+    baseUrl: baseUrl || undefined,
     agent: initialAgentType,
     rotation: rotation ?? undefined,
     rotationIndex: rotationActive ? 0 : undefined,
@@ -1955,6 +1998,7 @@ async function runRalphLoop(): Promise<void> {
   console.log(`Max iterations: ${maxIterations > 0 ? maxIterations : "unlimited"}`);
   console.log(`Agent: ${agentConfig.configName}`);
   if (initialModel) console.log(`Model: ${initialModel}`);
+  if (baseUrl) console.log(`Base URL: ${baseUrl}`);
   if (disablePlugins && agentConfig.type === "opencode") {
     console.log("OpenCode plugins: non-auth plugins disabled");
   }
@@ -2040,11 +2084,13 @@ async function runRalphLoop(): Promise<void> {
         allowAllPermissions,
         extraFlags: extraAgentFlags,
         streamOutput,
+        baseUrl: state.baseUrl,
       });
 
       const env = agentConfig.buildEnv({
         filterPlugins: disablePlugins,
         allowAllPermissions: allowAllPermissions,
+        baseUrl: state.baseUrl,
       });
 
       // Run agent using spawn for better argument handling
