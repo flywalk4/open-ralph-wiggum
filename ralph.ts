@@ -9,7 +9,7 @@
 import { $ } from "bun";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "fs";
 import { join } from "path";
-import { checkTerminalPromise, stripAnsi, tasksMarkdownAllComplete } from "./completion";
+import { checkTerminalPromise, checkAnywhereInOutput, stripAnsi, tasksMarkdownAllComplete } from "./completion";
 
 const VERSION = "1.2.3";
 
@@ -42,6 +42,11 @@ interface AgentConfig {
   buildEnv: (options: AgentEnvOptions) => Record<string, string>;
   parseToolOutput: (line: string) => string | null;
   configName: string;
+  /** How to detect the completion promise in agent output.
+   *  "terminal" (default): promise must be the final non-empty line.
+   *  "anywhere": promise may appear anywhere in the output (needed for
+   *  agents like aider that append their own lines after the AI response). */
+  completionCheck?: "terminal" | "anywhere";
 }
 
 interface JsonAgentConfig {
@@ -149,6 +154,10 @@ const ARGS_TEMPLATES: Record<string, (prompt: string, model: string, options?: A
     if (model) cmdArgs.push("--model", model);
     if (options?.baseUrl) cmdArgs.push("--openai-api-base", options.baseUrl);
     if (options?.allowAllPermissions) cmdArgs.push("--yes");
+    // Disable aider's own auto-commits — ralph handles commits after each iteration.
+    // Without this, aider commits first and then ralph commits the same changes again,
+    // causing the git log to be polluted and the loop to see no diff on the next run.
+    cmdArgs.push("--no-auto-commits");
     if (options?.extraFlags?.length) cmdArgs.push(...options.extraFlags);
     return cmdArgs;
   },
@@ -316,6 +325,9 @@ const BUILT_IN_AGENTS: Record<AgentType, AgentConfig> = {
     buildEnv: ENV_TEMPLATES["aider"],
     parseToolOutput: PARSE_PATTERNS["aider"],
     configName: "Aider",
+    // Aider appends "Applied edits to X" / "Committed: ..." after the AI response,
+    // so the promise tag is never the final line. Scan the full output instead.
+    completionCheck: "anywhere",
   },
 };
 
@@ -2356,9 +2368,12 @@ async function runRalphLoop(): Promise<void> {
       }
 
       const combinedOutput = `${result}\n${stderr}`;
-      const completionSignalDetected = checkCompletion(result, completionPromise);
-      const abortDetected = abortPromise ? checkCompletion(result, abortPromise) : false;
-      const taskCompletionDetected = tasksMode ? checkCompletion(result, taskPromise) : false;
+      const useAnywhereCheck = agentConfig.completionCheck === "anywhere";
+      const checkPromise = (output: string, promise: string) =>
+        useAnywhereCheck ? checkAnywhereInOutput(output, promise) : checkCompletion(output, promise);
+      const completionSignalDetected = checkPromise(result, completionPromise);
+      const abortDetected = abortPromise ? checkPromise(result, abortPromise) : false;
+      const taskCompletionDetected = tasksMode ? checkPromise(result, taskPromise) : false;
 
       let completionDetected = completionSignalDetected;
       if (tasksMode && completionSignalDetected) {

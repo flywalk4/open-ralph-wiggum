@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { checkTerminalPromise, getLastNonEmptyLine, tasksMarkdownAllComplete, filterGitLogIssues, mergePresetWithDefaults } from "../completion";
+import { checkTerminalPromise, checkAnywhereInOutput, getLastNonEmptyLine, tasksMarkdownAllComplete, filterGitLogIssues, mergePresetWithDefaults } from "../completion";
 
 describe("checkTerminalPromise", () => {
   it("detects completion when promise tag is the final non-empty line", () => {
@@ -69,6 +69,49 @@ describe("tasksMarkdownAllComplete", () => {
     ].join("\n");
 
     expect(tasksMarkdownAllComplete(markdown)).toBe(true);
+  });
+});
+
+describe("checkAnywhereInOutput — aider completion detection", () => {
+  it("detects promise mid-output (aider appends lines after AI response)", () => {
+    const output = [
+      "I'll fix the bug in auth.ts.",
+      "",
+      "auth.ts",
+      "<<<<<<< SEARCH",
+      "  old code",
+      "=======",
+      "  new code",
+      ">>>>>>> REPLACE",
+      "<promise>COMPLETE</promise>",
+      "Applied edits to auth.ts",
+      "Commit a1b2c3d fix: Fix the bug in auth.ts",
+    ].join("\n");
+    expect(checkAnywhereInOutput(output, "COMPLETE")).toBe(true);
+  });
+
+  it("returns false when promise is absent", () => {
+    const output = [
+      "I'll fix the bug.",
+      "Applied edits to auth.ts",
+      "Commit a1b2c3d fix: Fix the bug",
+    ].join("\n");
+    expect(checkAnywhereInOutput(output, "COMPLETE")).toBe(false);
+  });
+
+  it("is case-insensitive", () => {
+    const output = "some text\n<promise>complete</promise>\nApplied edits to foo.ts";
+    expect(checkAnywhereInOutput(output, "COMPLETE")).toBe(true);
+  });
+
+  it("does not false-positive on a different promise", () => {
+    const output = "Applied edits.\n<promise>READY_FOR_NEXT_TASK</promise>\nCommit abc";
+    expect(checkAnywhereInOutput(output, "COMPLETE")).toBe(false);
+  });
+
+  it("accepts whitespace inside promise tags", () => {
+    const output = "work done\n<promise>  COMPLETE  </promise>\nApplied edits to x.ts";
+    expect(checkAnywhereInOutput(output, "COMPLETE")).toBe(true);
   });
 });
 

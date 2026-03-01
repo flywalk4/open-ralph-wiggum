@@ -26,6 +26,17 @@ export function getLastNonEmptyLine(output: string): string | null {
 }
 
 /**
+ * Checks whether the exact promise tag appears anywhere in the output.
+ * Used for agents like aider that append their own lines after the AI response,
+ * so the promise tag is never the final line even when the AI outputs it correctly.
+ */
+export function checkAnywhereInOutput(output: string, promise: string): boolean {
+  const escapedPromise = escapeRegex(promise);
+  const pattern = new RegExp(`<promise>\\s*${escapedPromise}\\s*</promise>`, "i");
+  return pattern.test(output);
+}
+
+/**
  * Checks whether the exact promise tag appears as the final non-empty line.
  */
 export function checkTerminalPromise(output: string, promise: string): boolean {
