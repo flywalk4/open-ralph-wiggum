@@ -453,6 +453,12 @@ Arguments:
   --tasks, -t         Tasks Mode — work through a checklist in .ralph/ralph-tasks.md
   --task-promise TEXT Phrase that signals one task is done (default: READY_FOR_NEXT_TASK)
   --plan              Plan Mode — agent maintains IMPLEMENTATION_PLAN.md + activity.md;
+  --improving [N]     Improving Mode — after the task is done, ralph keeps running autonomous
+                      improvement cycles. Each cycle the agent picks the most valuable thing
+                      to improve (design, perf, tests, features, etc.) and implements it.
+                      N = number of cycles (default: unlimited). With --plan, each cycle
+                      gets a fresh IMPLEMENTATION_PLAN.md (old one archived as .cycle{N}.md)
+                      Example: ralph "build a todo app" --plan --improving 5
   --optimize          Optimize for small/weak models: strips git diagnosis, plan sections,
                       and verbose instructions — sends a minimal focused prompt instead
   --diff              Inject git diff of the previous iteration into every prompt so the
@@ -1125,6 +1131,8 @@ let optimize = false;
 let diff = false;
 let maxPromptTokens = 0;
 let presetName = "";
+let improvingMode = false;
+let improvingMax = 0; // 0 = unlimited cycles
 
 const promptParts: string[] = [];
 let extraAgentFlags: string[] = [];
@@ -1265,6 +1273,13 @@ for (let i = 0; i < args.length; i++) {
     handleQuestions = false;
   } else if (arg === "--plan") {
     planMode = true;
+  } else if (arg === "--improving") {
+    improvingMode = true;
+    const next = args[i + 1];
+    if (next && !next.startsWith("-") && /^\d+$/.test(next)) {
+      improvingMax = parseInt(next);
+      i++;
+    }
   } else if (arg === "--optimize") {
     optimize = true;
   } else if (arg === "--diff") {
@@ -1433,6 +1448,9 @@ interface RalphState {
   optimize?: boolean;
   diff?: boolean;
   maxPromptTokens?: number;
+  improvingMode?: boolean;   // run improvement cycles after completion
+  improvingMax?: number;     // 0 = unlimited
+  improvingCycle?: number;   // current cycle number (0 = initial task)
 }
 
 // Create or update state
@@ -1827,6 +1845,30 @@ This is iteration 1 and no planning files exist yet. Please do the following:
  * @param _agent - Agent config (reserved for future agent-specific prompt customization)
  * @param gitIssues - Recent git commits with issue keywords
  */
+/**
+ * Returns the prompt used at the start of each improvement cycle.
+ * The agent is asked to self-direct: choose the most valuable thing to improve,
+ * create a plan, implement it, then signal completion.
+ */
+function buildImprovingPrompt(cycle: number, maxCycles: number): string {
+  const cycleLabel = maxCycles > 0 ? `Improvement Cycle ${cycle} of ${maxCycles}` : `Improvement Cycle ${cycle}`;
+  return `# ${cycleLabel}
+
+You have successfully completed the previous task/cycle. Now enter autonomous improvement mode.
+
+Review the current state of the entire project and choose the SINGLE MOST VALUABLE improvement you can make right now. Think broadly — pick whatever area will have the greatest positive impact:
+
+- **Architecture & Design** — better abstractions, cleaner separation of concerns, remove duplication
+- **Performance** — speed up slow paths, reduce memory usage, optimize algorithms
+- **User Experience** — improve interface, usability, visual design, or feedback
+- **Reliability** — add tests, improve error handling, fix edge cases, add validation
+- **Code Quality** — refactor complex/unclear code, improve naming, add missing docs
+- **Security** — harden inputs, fix potential vulnerabilities, audit dependencies
+- **New Functionality** — add a feature that would deliver the most value
+
+Pick ONE focused area. If plan mode is active, create a fresh IMPLEMENTATION_PLAN.md for this improvement and update activity.md. Implement the improvement thoroughly, then output COMPLETE when done.`;
+}
+
 function buildPrompt(state: RalphState, _agent: AgentConfig, gitIssues: string[] = [], gitDiff = "", consecutiveNoChanges = 0): string {
   // Use custom template if provided
   if (promptTemplatePath) {
@@ -2469,6 +2511,9 @@ async function runRalphLoop(): Promise<void> {
     optimize: optimize || undefined,
     diff: diff || undefined,
     maxPromptTokens: maxPromptTokens || undefined,
+    improvingMode: improvingMode || undefined,
+    improvingMax: improvingMode ? improvingMax : undefined,
+    improvingCycle: improvingMode ? 0 : undefined,
   };
 
   if (!resuming) {
@@ -2519,6 +2564,10 @@ async function runRalphLoop(): Promise<void> {
     console.log("OpenCode plugins: non-auth plugins disabled");
   }
   if (allowAllPermissions) console.log("Permissions: auto-approve all tools");
+  if (improvingMode) {
+    const cycleLabel = improvingMax > 0 ? `${improvingMax} improvement cycle${improvingMax !== 1 ? "s" : ""}` : "unlimited improvement cycles";
+    console.log(`Improving mode: ENABLED (${cycleLabel} after completion)`);
+  }
   console.log("");
   console.log("Starting loop... (Ctrl+C to stop)");
   console.log("═".repeat(68));
@@ -2867,16 +2916,55 @@ async function runRalphLoop(): Promise<void> {
           console.log(`\n⏳ Completion promise detected, but minimum iterations (${minIterations}) not yet reached.`);
           console.log(`   Continuing to iteration ${state.iteration + 1}...`);
         } else {
+          const nextCycle = (state.improvingCycle ?? 0) + 1;
+          const cycleMax  = state.improvingMax ?? 0;
+          const moreImprovements = state.improvingMode && (cycleMax === 0 || nextCycle <= cycleMax);
+
           console.log(`\n╔══════════════════════════════════════════════════════════════════╗`);
-          console.log(`║  ✅ Completion promise detected: <promise>${completionPromise}</promise>`);
-          console.log(`║  Task completed in ${state.iteration} iteration(s)`);
+          if (state.improvingCycle && state.improvingCycle > 0) {
+            console.log(`║  ✅ Improvement cycle ${state.improvingCycle} complete`);
+          } else {
+            console.log(`║  ✅ Completion promise detected: <promise>${completionPromise}</promise>`);
+            console.log(`║  Task completed in ${state.iteration} iteration(s)`);
+          }
           console.log(`║  Total time: ${formatDurationLong(history.totalDurationMs)}`);
           console.log(`╚══════════════════════════════════════════════════════════════════╝`);
-          clearState();
-          clearHistory();
-          clearContext();
-          clearPendingQuestions();
-          break;
+
+          if (moreImprovements) {
+            const cycleLabel = cycleMax > 0 ? ` ${nextCycle} / ${cycleMax}` : ` ${nextCycle}`;
+            console.log(`\n🔧 Starting improvement cycle${cycleLabel}...`);
+            console.log("═".repeat(68));
+
+            // Archive old plan so the agent starts fresh
+            const planFilePath = join(process.cwd(), "IMPLEMENTATION_PLAN.md");
+            if (state.planMode && existsSync(planFilePath)) {
+              const archiveName = `IMPLEMENTATION_PLAN.cycle${state.improvingCycle ?? 0}.md`;
+              writeFileSync(join(process.cwd(), archiveName), readFileSync(planFilePath, "utf-8"));
+              unlinkSync(planFilePath);
+              console.log(`📦 Archived plan → ${archiveName}`);
+            }
+
+            // Reset iteration for the new cycle; update prompt and cycle counter
+            state.iteration = 1;
+            state.improvingCycle = nextCycle;
+            state.prompt = buildImprovingPrompt(nextCycle, cycleMax);
+            clearHistory();
+            clearContext();
+            clearPendingQuestions();
+            saveState(state);
+            consecutiveNoChanges = 0;
+            // Don't break — continue the while loop into the new cycle
+          } else {
+            if (state.improvingMode) {
+              const done = state.improvingCycle ?? 0;
+              console.log(`\n🏁 All ${done} improvement cycle${done !== 1 ? "s" : ""} complete.`);
+            }
+            clearState();
+            clearHistory();
+            clearContext();
+            clearPendingQuestions();
+            break;
+          }
         }
       }
 

@@ -186,6 +186,11 @@ async function launchRalph(formData: URLSearchParams, serverCwd: string): Promis
   addBool("--tasks", "tasks");
   addBool("--optimize", "optimize");
   addBool("--diff", "diff");
+  if (formData.get("improving") === "on") {
+    const cycles = formData.get("improving-cycles")?.trim();
+    args.push("--improving");
+    if (cycles && /^\d+$/.test(cycles)) args.push(cycles);
+  }
   addBool("--no-commit", "no-commit");
   addBool("--allow-all", "allow-all");
   addBool("--no-plugins", "no-plugins");
@@ -1322,6 +1327,25 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
             </span>
           </label>
         </div>
+        <!-- Improving mode row -->
+        <div class="form-row" style="margin-top:12px;align-items:flex-end">
+          <div class="form-group" style="flex:0 0 auto">
+            <label class="checkbox-label" style="margin:0">
+              <input type="checkbox" name="improving" id="improving-cb"
+                onchange="document.getElementById('improving-cycles').disabled=!this.checked">
+              <span class="cb-text">
+                <span class="cb-name">--improving</span>
+                <span class="cb-desc">Keep running after completion — ralph autonomously
+                  picks and implements improvements (design, performance, tests, features, etc.)</span>
+              </span>
+            </label>
+          </div>
+          <div class="form-group" style="flex:0 0 140px">
+            <label for="improving-cycles">Improvement cycles</label>
+            <input type="number" name="improving-cycles" id="improving-cycles"
+              min="1" placeholder="unlimited" disabled>
+          </div>
+        </div>
       </div>
 
       <!-- OPTIONS -->
@@ -1665,6 +1689,8 @@ function routeStatus(cwd: string): string {
         ${rowOf("Completion signal", escapeHtml(String(state!.completionPromise ?? "COMPLETE")), true)}
         ${state!.planMode  ? rowOf("Plan mode",  '<span class="badge badge-blue">ON</span>') : ""}
         ${state!.tasksMode ? rowOf("Tasks mode", '<span class="badge badge-blue">ON</span>') : ""}
+        ${state!.improvingMode ? rowOf("Improving mode",
+          `<span class="badge badge-blue">Cycle ${state!.improvingCycle ?? 0}${state!.improvingMax ? ` / ${state!.improvingMax}` : " (unlimited)"}</span>`) : ""}
         ${rowOf("Prompt", escapeHtml(String(state!.prompt ?? "").substring(0, 160)) + (String(state!.prompt ?? "").length > 160 ? "…" : ""))}
       </div>`;
   }
@@ -1833,6 +1859,11 @@ function buildActivityHtml(projectCwd: string, state: Record<string, unknown> | 
     : "";
 
   // ── Status bar ────────────────────────────────────────────────────────────
+  const improvingCycle = Number(state?.improvingCycle ?? 0);
+  const improvingMax   = Number(state?.improvingMax ?? 0);
+  const improvingBadge = state?.improvingMode
+    ? `<span class="sep">|</span><span class="badge badge-blue" style="font-size:10px">🔧 Cycle ${improvingCycle}${improvingMax > 0 ? ` / ${improvingMax}` : ""}</span>`
+    : "";
   const statusBar = isActive ? `
     <div class="activity-status-bar">
       <span class="badge badge-green" id="act-status">● ACTIVE</span>
@@ -1841,6 +1872,7 @@ function buildActivityHtml(projectCwd: string, state: Record<string, unknown> | 
       <span class="sep">|</span>
       <span>Agent: <strong>${escapeHtml(agent)}</strong></span>
       ${elapsed ? `<span class="sep">|</span><span>Elapsed: <strong id="act-elapsed">${elapsed}</strong></span>` : ""}
+      ${improvingBadge}
     </div>` : "";
 
   // ── Task list from IMPLEMENTATION_PLAN.md ─────────────────────────────────
