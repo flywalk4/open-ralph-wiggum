@@ -42,11 +42,13 @@ Open Ralph Wiggum works with multiple AI coding agents. Switch between them usin
 | **Codex** | `--agent codex` | OpenAI's Codex CLI for AI-powered development |
 | **Copilot CLI** | `--agent copilot` | GitHub Copilot CLI for agentic coding |
 | **Aider** | `--agent aider` | Aider AI pair programming (supports local models via `--base-url`) |
+| **LLM** | `--agent llm` | Built-in agent — calls any OpenAI-compatible API directly, no extra tools needed |
 
 ```bash
 ralph "Build a REST API" --agent claude-code --max-iterations 10
 ralph "Create a CLI tool" --agent codex --max-iterations 10
 ralph "Fix failing tests" --agent aider --model ollama/qwen2.5-coder --base-url http://localhost:11434/v1
+ralph "Create a website" --agent llm --model qwen2.5-coder:32b --base-url http://localhost:11434/v1
 ```
 
 ---
@@ -75,9 +77,11 @@ done
 - **Plan Mode** — `--plan` keeps `IMPLEMENTATION_PLAN.md` and `activity.md` in sync across iterations
 - **Task Tracking** — `--tasks` mode breaks complex projects into a managed checklist
 - **Presets** — `--preset NAME` loads saved prompt/config combos from `presets.json`
-- **Local Model Support** — `--base-url` connects to any OpenAI-compatible API (Ollama, LM Studio, etc.)
+- **Local Model Support** — built-in `llm` agent + `--base-url` for any OpenAI-compatible API; `--optimize` and `--max-prompt-tokens` tune the prompt for small models; Ollama model list auto-detected when `--model` is omitted
 - **Agent Rotation** — `--rotation` cycles through different agent/model pairs each iteration
 - **Mid-Loop Hints** — Inject guidance with `--add-context` or via the dashboard without stopping the loop
+- **Auto Stuck Detection** — after 3 consecutive iterations with no file changes, automatically injects a warning into the prompt urging the agent to try a different approach
+- **Diff Injection** — `--diff` shows the agent exactly what it changed in the previous iteration via `git diff HEAD~1`
 - **Live Monitoring** — Check progress with `--status` or the web dashboard from another terminal
 
 ---
@@ -165,7 +169,7 @@ ralph dashboard [--port N] [--open]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--agent AGENT` | `opencode` | Agent: `opencode`, `claude-code`, `codex`, `copilot`, `aider` |
+| `--agent AGENT` | `opencode` | Agent: `opencode`, `claude-code`, `codex`, `copilot`, `aider`, `llm` |
 | `--model MODEL` | agent default | Model name (e.g. `anthropic/claude-sonnet-4`) |
 | `--min-iterations N` | `1` | Minimum iterations before completion is accepted |
 | `--max-iterations N` | unlimited | Stop after N iterations |
@@ -188,6 +192,9 @@ ralph dashboard [--port N] [--open]
 | `--tasks, -t` | Tasks Mode — work through a checklist in `.ralph/ralph-tasks.md` |
 | `--task-promise TEXT` | Signal for one task done (default: `READY_FOR_NEXT_TASK`) |
 | `--plan` | Plan Mode — agent maintains `IMPLEMENTATION_PLAN.md` + `activity.md` |
+| `--optimize` | Strip all non-essential prompt sections (git diagnosis, plan files, verbose instructions). Recommended for small/weak local models |
+| `--diff` | Inject `git diff HEAD~1` into every prompt so the agent can see exactly what it changed in the previous iteration |
+| `--max-prompt-tokens N` | Truncate the prompt to ~N tokens. Keeps the task (start) and completion signal (end); removes middle sections |
 
 ### Multi-Agent Rotation
 
@@ -203,13 +210,39 @@ Each entry must be `agent:model`. When `--rotation` is used, `--agent` and `--mo
 ### Local / OpenAI-compatible Models
 
 ```bash
-ralph "Fix tests" \
-  --agent aider \
-  --model ollama/qwen2.5-coder \
+# Built-in LLM agent — no extra tools, works with any model that generates text
+ralph "Fix the failing tests" \
+  --agent llm --model qwen2.5-coder:32b \
+  --base-url http://192.168.1.100:11434/v1
+
+# With optimizations for small/weak models
+ralph "Create a landing page" \
+  --agent llm --model qwen2.5-coder:7b \
+  --base-url http://localhost:11434/v1 \
+  --optimize --max-prompt-tokens 2048
+
+# Aider with a local model
+ralph "Fix the failing tests" \
+  --agent aider --model ollama/qwen2.5-coder \
+  --base-url http://localhost:11434/v1
+
+# OpenCode with a local model (auto-registers the provider)
+ralph "Fix the failing tests" \
+  --agent opencode --model qwen2.5-coder:32b \
   --base-url http://localhost:11434/v1
 ```
 
 The `--base-url` flag works with any OpenAI-compatible server (Ollama, LM Studio, vLLM, etc.).
+
+**Ollama model auto-detect:** if you pass `--base-url` without `--model`, ralph will fetch the available models from Ollama and show a usage example.
+
+**Agent comparison for local models:**
+
+| Agent | Requires | Best for |
+|-------|----------|----------|
+| `llm` | Nothing extra | Any model, simple file generation |
+| `opencode` | opencode CLI | 14B+ models with function calling |
+| `aider` | aider CLI | Models with good diff-following |
 
 ### Output & Permissions
 
