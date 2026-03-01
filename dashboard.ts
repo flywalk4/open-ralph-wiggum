@@ -157,12 +157,15 @@ function loadCurrentProject(serverCwd: string): string {
 
 async function launchRalph(formData: URLSearchParams, serverCwd: string): Promise<string | null> {
   const prompt = formData.get("prompt")?.trim() ?? "";
-  if (!prompt) return "Prompt is required";
+  const improvingChecked = formData.get("improving") === "on";
+  // Prompt is optional when --improving is set (ralph starts in improvement cycle 1)
+  if (!prompt && !improvingChecked) return "Prompt is required";
 
   // Use process.execPath (absolute path to the current bun binary) so
   // Bun.spawn can find it without relying on PATH, which is not inherited
   // from the shell on Windows.
-  const args: string[] = [process.execPath, RALPH_SCRIPT_PATH, prompt];
+  const args: string[] = [process.execPath, RALPH_SCRIPT_PATH];
+  if (prompt) args.push(prompt);
 
   const add = (flag: string, val: string | null) => {
     if (val?.trim()) args.push(flag, val.trim());
@@ -1212,7 +1215,7 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
       <div class="form-section">
         <div class="form-section-title">✏ Prompt</div>
         <div class="form-group">
-          <label for="prompt">Task description<span class="required">*</span></label>
+          <label for="prompt">Task description <span class="required" id="prompt-required">*</span><span id="prompt-optional" style="display:none;font-size:11px;color:var(--text-muted);font-weight:400"> (optional with --improving)</span></label>
           <textarea name="prompt" id="prompt" rows="6"
             placeholder="e.g. Fix the failing tests in tests/auth.test.ts and make sure all assertions pass"></textarea>
         </div>
@@ -1332,7 +1335,7 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
           <div class="form-group" style="flex:0 0 auto">
             <label class="checkbox-label" style="margin:0">
               <input type="checkbox" name="improving" id="improving-cb"
-                onchange="document.getElementById('improving-cycles').disabled=!this.checked">
+                onchange="document.getElementById('improving-cycles').disabled=!this.checked;document.getElementById('prompt-required').style.display=this.checked?'none':'';document.getElementById('prompt-optional').style.display=this.checked?'':'none'">
               <span class="cb-text">
                 <span class="cb-name">--improving</span>
                 <span class="cb-desc">Keep running after completion — ralph autonomously
