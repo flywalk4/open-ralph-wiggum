@@ -455,6 +455,10 @@ Arguments:
   --plan              Plan Mode — agent maintains IMPLEMENTATION_PLAN.md + activity.md;
   --optimize          Optimize for small/weak models: strips git diagnosis, plan sections,
                       and verbose instructions — sends a minimal focused prompt instead
+  --diff              Inject git diff of the previous iteration into every prompt so the
+                      agent can see exactly what it changed last time
+  --max-prompt-tokens N  Truncate the prompt to approximately N tokens (1 token ≈ 4 chars).
+                      Keeps the start and end; truncates the middle sections
                       both files are injected into every iteration's prompt
 
 ── Multi-agent Rotation ─────────────────────────────────────────────────────────
@@ -1025,6 +1029,8 @@ let promptSource = "";
 let handleQuestions = true;
 let planMode = false;
 let optimize = false;
+let diff = false;
+let maxPromptTokens = 0;
 let presetName = "";
 
 const promptParts: string[] = [];
@@ -1168,6 +1174,15 @@ for (let i = 0; i < args.length; i++) {
     planMode = true;
   } else if (arg === "--optimize") {
     optimize = true;
+  } else if (arg === "--diff") {
+    diff = true;
+  } else if (arg === "--max-prompt-tokens") {
+    const val = args[++i];
+    if (!val || isNaN(Number(val))) {
+      console.error("Error: --max-prompt-tokens requires a number");
+      process.exit(1);
+    }
+    maxPromptTokens = parseInt(val);
   } else if (arg === "--preset") {
     const val = args[++i];
     if (!val) {
@@ -1323,6 +1338,8 @@ interface RalphState {
   rotationIndex?: number;
   planMode?: boolean;
   optimize?: boolean;
+  diff?: boolean;
+  maxPromptTokens?: number;
 }
 
 // Create or update state
@@ -1643,6 +1660,24 @@ async function parseGitLogIssues(): Promise<string[]> {
   }
 }
 
+async function parseGitDiff(): Promise<string> {
+  try {
+    const commitCount = parseInt((await $`git rev-list --count HEAD`.text()).trim());
+    if (commitCount < 2) return "";
+    const stat = (await $`git diff HEAD~1 --stat`.text()).trim();
+    if (!stat) return "";
+    const raw = (await $`git diff HEAD~1`.text()).trim();
+    // Limit to 200 lines to avoid flooding small model context windows
+    const lines = raw.split("\n");
+    const body = lines.length > 200
+      ? lines.slice(0, 200).join("\n") + "\n... (diff truncated)"
+      : raw;
+    return `${stat}\n\n${body}`;
+  } catch {
+    return "";
+  }
+}
+
 /**
  * Build the plan mode section injected into the prompt.
  */
@@ -1699,7 +1734,7 @@ This is iteration 1 and no planning files exist yet. Please do the following:
  * @param _agent - Agent config (reserved for future agent-specific prompt customization)
  * @param gitIssues - Recent git commits with issue keywords
  */
-function buildPrompt(state: RalphState, _agent: AgentConfig, gitIssues: string[] = []): string {
+function buildPrompt(state: RalphState, _agent: AgentConfig, gitIssues: string[] = [], gitDiff = "", consecutiveNoChanges = 0): string {
   // Use custom template if provided
   if (promptTemplatePath) {
     const customPrompt = loadCustomPromptTemplate(promptTemplatePath, state);
@@ -1730,6 +1765,14 @@ ${context}
     ? `\n## Recent Git Issues (fix these before advancing)\n\n${gitIssues.map(l => `- ${l}`).join("\n")}\n\n---\n`
     : "";
 
+  const diffSection = gitDiff
+    ? `\n## Changes You Made in the Previous Iteration\n\n\`\`\`diff\n${gitDiff}\n\`\`\`\n\n---\n`
+    : "";
+
+  const stuckHint = consecutiveNoChanges >= 3
+    ? `\n## ⚠️ No File Changes Detected (${consecutiveNoChanges} iterations)\n\nYou have not modified any files in the last ${consecutiveNoChanges} iterations. Try a completely different approach — re-read the task, check what files exist, and make at least one concrete change.\n\n---\n`
+    : "";
+
   const planSection = state.planMode ? buildPlanModeSection(state) : "";
 
   // Tasks mode: use task-specific instructions
@@ -1739,7 +1782,7 @@ ${context}
 # Ralph Wiggum Loop - Iteration ${state.iteration}
 
 You are in an iterative development loop working through a task list.
-${contextSection}${gitSection}${planSection}${tasksSection}
+${contextSection}${gitSection}${diffSection}${stuckHint}${planSection}${tasksSection}
 ## Your Main Goal
 
 ${state.prompt}
@@ -1767,7 +1810,7 @@ Now, work on the current task. Good luck!
 # Ralph Wiggum Loop - Iteration ${state.iteration}
 
 You are in an iterative development loop. Work on the task below until you can genuinely complete it.
-${contextSection}${gitSection}${planSection}
+${contextSection}${gitSection}${diffSection}${stuckHint}${planSection}
 ## Your Task
 
 ${state.prompt}
@@ -2253,6 +2296,8 @@ async function runRalphLoop(): Promise<void> {
     rotation = existingState.rotation ?? null;
     planMode = existingState.planMode ?? false;
     optimize = existingState.optimize ?? false;
+    diff = existingState.diff ?? false;
+    maxPromptTokens = existingState.maxPromptTokens ?? 0;
     console.log(`🔄 Resuming Ralph loop from ${statePath}`);
   }
 
@@ -2270,6 +2315,24 @@ async function runRalphLoop(): Promise<void> {
   const initialEntry = rotationActive ? runtimeRotation[rotationIndex].split(":") : null;
   const initialAgentType = rotationActive ? (initialEntry![0] as AgentType) : agentType;
   const initialModel = rotationActive ? initialEntry![1] : model;
+
+  // Auto-detect available models when --base-url is given but --model is omitted
+  if (baseUrl && !model) {
+    const ollamaBase = baseUrl.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
+    try {
+      const resp = await fetch(`${ollamaBase}/api/tags`);
+      if (resp.ok) {
+        const data = await resp.json() as { models?: Array<{ name: string }> };
+        const models = (data.models ?? []).map(m => m.name).filter(Boolean);
+        if (models.length > 0) {
+          console.error(`Error: --model is required. Models available on ${ollamaBase}:\n`);
+          models.forEach(m => console.error(`  ${m}`));
+          console.error(`\nExample: ralph "task" --agent ${initialAgentType} --model ${models[0]} --base-url ${baseUrl}`);
+          process.exit(1);
+        }
+      }
+    } catch { /* not Ollama or unreachable — fall through to normal error */ }
+  }
 
   if (rotationActive) {
     const uniqueAgents = Array.from(new Set(runtimeRotation!.map(entry => entry.split(":")[0]))) as AgentType[];
@@ -2318,6 +2381,8 @@ async function runRalphLoop(): Promise<void> {
     rotationIndex: rotationActive ? 0 : undefined,
     planMode: planMode || undefined,
     optimize: optimize || undefined,
+    diff: diff || undefined,
+    maxPromptTokens: maxPromptTokens || undefined,
   };
 
   if (!resuming) {
@@ -2332,6 +2397,8 @@ async function runRalphLoop(): Promise<void> {
     writeFileSync(tasksPath, "# Ralph Tasks\n\nAdd your tasks below using: `ralph --add-task \"description\"`\n");
     console.log(`📋 Created tasks file: ${tasksPath}`);
   }
+
+  let consecutiveNoChanges = 0;
 
   // Initialize history tracking
   const history: RalphHistory = resuming ? loadHistory() : {
@@ -2437,7 +2504,20 @@ async function runRalphLoop(): Promise<void> {
 
     // Build the prompt
     const gitIssues = await parseGitLogIssues();
-    const fullPrompt = buildPrompt(state, agentConfig, gitIssues);
+    const gitDiff = state.diff ? await parseGitDiff() : "";
+    let fullPrompt = buildPrompt(state, agentConfig, gitIssues, gitDiff, consecutiveNoChanges);
+
+    // Truncate prompt if --max-prompt-tokens is set (rough estimate: 1 token ≈ 4 chars)
+    if (state.maxPromptTokens && state.maxPromptTokens > 0) {
+      const charLimit = state.maxPromptTokens * 4;
+      if (fullPrompt.length > charLimit) {
+        const keep = Math.floor(charLimit * 0.45);
+        fullPrompt = fullPrompt.slice(0, keep)
+          + `\n\n...[middle of prompt truncated to fit ~${state.maxPromptTokens} token limit]...\n\n`
+          + fullPrompt.slice(-keep);
+      }
+    }
+
     const iterationStart = Date.now();
 
     try {
@@ -2560,10 +2640,12 @@ async function runRalphLoop(): Promise<void> {
       history.totalDurationMs += iterationDuration;
 
       // Update struggle indicators
-      if (filesModified.length === 0) {
+      if (filesModified.length === 0 && !completionDetected) {
         history.struggleIndicators.noProgressIterations++;
+        consecutiveNoChanges++;
       } else {
-        history.struggleIndicators.noProgressIterations = 0; // Reset on progress
+        history.struggleIndicators.noProgressIterations = 0;
+        consecutiveNoChanges = 0;
       }
 
       if (iterationDuration < 30000) { // Less than 30 seconds
