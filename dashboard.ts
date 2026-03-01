@@ -1619,9 +1619,10 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
               + (d.lastRun.iteration ? ' · <span style="font-size:11px">' + d.lastRun.iteration + ' iterations</span>' : '');
             if (d.lastRun.prompt) {
               const p = String(d.lastRun.prompt);
+              const safeP = p.replace(/&/g,'&amp;').replace(/"/g,'&quot;');
               html += '<div class="project-last-prompt">' + esc(p.substring(0, 140)) + (p.length > 140 ? '…' : '') + '</div>'
                 + '<button type="button" class="btn btn-ghost btn-sm" style="margin-top:8px" '
-                + 'onclick="resumeLastRun(' + esc(JSON.stringify(p)) + ')">↩ Resume last run</button>';
+                + 'data-prompt="' + safeP + '" onclick="resumeLastRun(this.dataset.prompt)">↩ Resume last run</button>';
             }
             html += '</div>';
           } else {
