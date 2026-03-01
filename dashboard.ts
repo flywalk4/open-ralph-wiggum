@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
 /**
- * Ralph Wiggum Dashboard — Bun HTTP server for monitoring & intervention
- * Serves a minimal HTML UI (no client-side JS, pure forms).
+ * Ralph Wiggum Dashboard — Full-featured web UI for launching and monitoring Ralph loops.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "fs";
 import { join } from "path";
 
-// ─── Path helpers ───────────────────────────────────────────────────────────
+// ─── Path constants ───────────────────────────────────────────────────────────
+
+const RALPH_README_PATH = join(import.meta.dir, "README.md");
+const RALPH_SCRIPT_PATH = join(import.meta.dir, "ralph.ts");
+
+// ─── Path helpers ─────────────────────────────────────────────────────────────
 
 function stateDir(cwd: string): string { return join(cwd, ".ralph"); }
 function statePath(cwd: string): string { return join(stateDir(cwd), "ralph-loop.state.json"); }
@@ -15,13 +19,9 @@ function historyPath(cwd: string): string { return join(stateDir(cwd), "ralph-hi
 function contextPath(cwd: string): string { return join(stateDir(cwd), "ralph-context.md"); }
 function planPath(cwd: string): string { return join(cwd, "IMPLEMENTATION_PLAN.md"); }
 function activityPath(cwd: string): string { return join(cwd, "activity.md"); }
+function pidPath(cwd: string): string { return join(stateDir(cwd), "dashboard-pid.json"); }
 
-// README is always read from the ralph package directory, not the project cwd.
-// This way the dashboard always shows ralph's own docs regardless of what project
-// you're running it from.
-const RALPH_README_PATH = join(import.meta.dir, "README.md");
-
-// ─── Data loaders ────────────────────────────────────────────────────────────
+// ─── Data loaders ─────────────────────────────────────────────────────────────
 
 function loadState(cwd: string): Record<string, unknown> | null {
   const p = statePath(cwd);
@@ -50,7 +50,92 @@ function lastNLines(text: string, n: number): string {
   return text.split("\n").slice(-n).join("\n");
 }
 
-// ─── Markdown → HTML ─────────────────────────────────────────────────────────
+// ─── PID helpers ──────────────────────────────────────────────────────────────
+
+function storePid(cwd: string, pid: number): void {
+  const dir = stateDir(cwd);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(pidPath(cwd), JSON.stringify({ pid, startedAt: new Date().toISOString() }));
+}
+
+function loadPid(cwd: string): number | null {
+  const p = pidPath(cwd);
+  if (!existsSync(p)) return null;
+  try { return JSON.parse(readFileSync(p, "utf-8")).pid ?? null; } catch { return null; }
+}
+
+// ─── Launch / Stop ────────────────────────────────────────────────────────────
+
+async function launchRalph(formData: URLSearchParams, serverCwd: string): Promise<string | null> {
+  const prompt = formData.get("prompt")?.trim() ?? "";
+  if (!prompt) return "Prompt is required";
+
+  const args: string[] = ["bun", RALPH_SCRIPT_PATH, prompt];
+
+  const add = (flag: string, val: string | null) => {
+    if (val?.trim()) args.push(flag, val.trim());
+  };
+  const addBool = (flag: string, key: string) => {
+    if (formData.get(key) === "on") args.push(flag);
+  };
+
+  add("--agent", formData.get("agent"));
+  add("--model", formData.get("model"));
+  add("--base-url", formData.get("base-url"));
+  add("--max-iterations", formData.get("max-iterations"));
+  add("--min-iterations", formData.get("min-iterations"));
+  add("--completion-promise", formData.get("completion-promise"));
+  add("--abort-promise", formData.get("abort-promise"));
+  add("--max-prompt-tokens", formData.get("max-prompt-tokens"));
+  add("--rotation", formData.get("rotation"));
+  add("--preset", formData.get("preset"));
+
+  addBool("--plan", "plan");
+  addBool("--tasks", "tasks");
+  addBool("--optimize", "optimize");
+  addBool("--diff", "diff");
+  addBool("--no-commit", "no-commit");
+  addBool("--allow-all", "allow-all");
+  addBool("--no-plugins", "no-plugins");
+  addBool("--no-stream", "no-stream");
+  addBool("--verbose-tools", "verbose-tools");
+  addBool("--no-questions", "no-questions");
+
+  const extraCwd = formData.get("cwd")?.trim() || serverCwd;
+
+  const proc = Bun.spawn(args, {
+    cwd: extraCwd,
+    detached: true,
+    stdout: "ignore",
+    stderr: "ignore",
+    stdin: "ignore",
+  });
+
+  storePid(serverCwd, proc.pid);
+  return null; // success
+}
+
+async function stopRalph(cwd: string): Promise<boolean> {
+  const pid = loadPid(cwd);
+  if (!pid) return false;
+  try {
+    if (process.platform === "win32") {
+      Bun.spawn(["taskkill", "/PID", String(pid), "/F", "/T"], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+    } else {
+      process.kill(pid, "SIGTERM");
+    }
+    const p = pidPath(cwd);
+    if (existsSync(p)) unlinkSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── HTML utils ───────────────────────────────────────────────────────────────
 
 function escapeHtml(str: string): string {
   return str
@@ -60,61 +145,35 @@ function escapeHtml(str: string): string {
     .replace(/"/g, "&quot;");
 }
 
-/**
- * Process inline Markdown: code spans, images (alt only), links, bold, italic.
- * Escapes HTML in text content first so user content can't inject markup.
- */
+// ─── Markdown → HTML ──────────────────────────────────────────────────────────
+
 function inlineMarkdown(raw: string): string {
   let s = escapeHtml(raw);
-
-  // Protect inline code from further processing
   const codeSpans: string[] = [];
   s = s.replace(/`([^`]+)`/g, (_, code) => {
     const idx = codeSpans.length;
     codeSpans.push(`<code>${code}</code>`);
     return `\x00CODE${idx}\x00`;
   });
-
-  // Images → show alt text only (no broken external image requests)
   s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_, alt) => alt ? `<em>${alt}</em>` : "");
-
-  // Links → open in new tab
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
     (_, text, href) => `<a href="${href}" target="_blank" rel="noopener">${text}</a>`);
-
-  // Bold + italic: ***text***
   s = s.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
-  // Bold: **text**
   s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  // Italic: *text* (avoid false positives on bullet items)
   s = s.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<em>$1</em>");
-
-  // Restore code spans
   s = s.replace(/\x00CODE(\d+)\x00/g, (_, idx) => codeSpans[parseInt(idx)]);
-
   return s;
 }
 
-/**
- * Full Markdown → HTML renderer used for the README.
- * Handles: HTML passthrough, fenced code blocks, tables, ordered/unordered
- * lists (including indented sublists), headings, horizontal rules, links,
- * images (alt text only), bold, italic, inline code.
- */
 function markdownToHtml(md: string): string {
   const lines = md.split("\n");
   const out: string[] = [];
-
-  let inCode = false;
-  let inHtmlBlock = false;
-  let inTable = false;
-  let tableHeaderDone = false;
-  let inUl = false;
-  let inOl = false;
+  let inCode = false, inHtmlBlock = false, inTable = false, tableHeaderDone = false;
+  let inUl = false, inOl = false;
 
   function closeContainers() {
-    if (inUl)    { out.push("</ul>");          inUl = false; }
-    if (inOl)    { out.push("</ol>");          inOl = false; }
+    if (inUl)    { out.push("</ul>"); inUl = false; }
+    if (inOl)    { out.push("</ol>"); inOl = false; }
     if (inTable) { out.push("</tbody></table>"); inTable = false; tableHeaderDone = false; }
   }
 
@@ -122,56 +181,22 @@ function markdownToHtml(md: string): string {
     const line = lines[i];
     const trimmed = line.trim();
 
-    // ── Fenced code block ───────────────────────────────────────────────────
     if (trimmed.startsWith("```")) {
-      if (inCode) {
-        out.push("</code></pre>");
-        inCode = false;
-      } else {
-        closeContainers();
-        inHtmlBlock = false;
-        out.push("<pre><code>");
-        inCode = true;
-      }
+      if (inCode) { out.push("</code></pre>"); inCode = false; }
+      else { closeContainers(); inHtmlBlock = false; out.push("<pre><code>"); inCode = true; }
       continue;
     }
-
-    if (inCode) {
-      out.push(escapeHtml(line));
-      continue;
-    }
-
-    // ── Blank line ──────────────────────────────────────────────────────────
-    if (trimmed === "") {
-      closeContainers();
-      inHtmlBlock = false;
-      out.push("");
-      continue;
-    }
-
-    // ── HTML passthrough block ──────────────────────────────────────────────
-    // The ralph README uses <p align="center">, badge <img> tags, etc.
-    // Pass these through as-is; replace <img> with alt text to avoid broken images.
+    if (inCode) { out.push(escapeHtml(line)); continue; }
+    if (trimmed === "") { closeContainers(); inHtmlBlock = false; out.push(""); continue; }
     if (trimmed.startsWith("<") || inHtmlBlock) {
-      closeContainers();
-      inHtmlBlock = true;
-      // Replace external images with their alt text
+      closeContainers(); inHtmlBlock = true;
       const safe = line.replace(/<img([^>]*)>/gi, (_, attrs) => {
         const alt = attrs.match(/alt="([^"]*)"/i)?.[1] ?? "";
         return alt ? `<em>${escapeHtml(alt)}</em>` : "";
       });
-      out.push(safe);
-      continue;
+      out.push(safe); continue;
     }
-
-    // ── Horizontal rule ─────────────────────────────────────────────────────
-    if (/^[-*_]{3,}$/.test(trimmed)) {
-      closeContainers();
-      out.push("<hr>");
-      continue;
-    }
-
-    // ── Headings ─────────────────────────────────────────────────────────────
+    if (/^[-*_]{3,}$/.test(trimmed)) { closeContainers(); out.push("<hr>"); continue; }
     const headingMatch = trimmed.match(/^(#{1,4}) (.+)/);
     if (headingMatch) {
       closeContainers();
@@ -179,97 +204,61 @@ function markdownToHtml(md: string): string {
       out.push(`<h${level}>${inlineMarkdown(headingMatch[2])}</h${level}>`);
       continue;
     }
-
-    // ── Table row ─────────────────────────────────────────────────────────────
     if (trimmed.startsWith("|")) {
-      // Separator row: |---|---| — skip it (we already emitted </thead><tbody>)
       if (/^\|[\s\-:|]+\|$/.test(trimmed)) {
-        if (inTable && !tableHeaderDone) {
-          tableHeaderDone = true;
-        }
+        if (inTable && !tableHeaderDone) tableHeaderDone = true;
         continue;
       }
-
       const cells = trimmed.slice(1, trimmed.endsWith("|") ? -1 : undefined)
-        .split("|")
-        .map(c => c.trim());
-
+        .split("|").map(c => c.trim());
       if (!inTable) {
         closeContainers();
         out.push('<table><thead><tr>');
         out.push(cells.map(c => `<th>${inlineMarkdown(c)}</th>`).join(""));
         out.push('</tr></thead><tbody>');
-        inTable = true;
-        tableHeaderDone = false;
-        // Peek ahead: skip separator row
+        inTable = true; tableHeaderDone = false;
         if (lines[i + 1] && /^\|[\s\-:|]+\|$/.test(lines[i + 1].trim())) {
-          i++;
-          tableHeaderDone = true;
+          i++; tableHeaderDone = true;
         }
       } else {
         out.push("<tr>" + cells.map(c => `<td>${inlineMarkdown(c)}</td>`).join("") + "</tr>");
       }
       continue;
     } else if (inTable) {
-      // Non-table line closes the table
-      out.push("</tbody></table>");
-      inTable = false;
-      tableHeaderDone = false;
+      out.push("</tbody></table>"); inTable = false; tableHeaderDone = false;
     }
-
-    // ── Unordered list (top-level and indented) ──────────────────────────────
     const ulMatch = line.match(/^(\s*)[-*+] (.+)/);
     if (ulMatch) {
       const indent = ulMatch[1].length;
       const content = inlineMarkdown(ulMatch[2]);
       if (inOl) { out.push("</ol>"); inOl = false; }
       if (!inUl) { out.push("<ul>"); inUl = true; }
-      if (indent >= 2) {
-        out.push(`<li style="margin-left:${indent * 6}px">${content}</li>`);
-      } else {
-        out.push(`<li>${content}</li>`);
-      }
+      out.push(indent >= 2 ? `<li style="margin-left:${indent * 6}px">${content}</li>` : `<li>${content}</li>`);
       continue;
     }
-
-    // ── Ordered list ─────────────────────────────────────────────────────────
     const olMatch = line.match(/^(\s*)\d+\. (.+)/);
     if (olMatch) {
       const indent = olMatch[1].length;
       const content = inlineMarkdown(olMatch[2]);
       if (inUl) { out.push("</ul>"); inUl = false; }
       if (!inOl) { out.push("<ol>"); inOl = true; }
-      if (indent >= 2) {
-        out.push(`<li style="margin-left:${indent * 6}px">${content}</li>`);
-      } else {
-        out.push(`<li>${content}</li>`);
-      }
+      out.push(indent >= 2 ? `<li style="margin-left:${indent * 6}px">${content}</li>` : `<li>${content}</li>`);
       continue;
     }
-
-    // Close any open list/table if we hit a plain paragraph
     closeContainers();
-
-    // ── Paragraph ─────────────────────────────────────────────────────────────
     out.push(`<p>${inlineMarkdown(trimmed)}</p>`);
   }
-
   closeContainers();
   if (inCode) out.push("</code></pre>");
-
   return out.join("\n");
 }
 
-/** Simpler variant used for agent-generated plan/activity files (no HTML passthrough). */
 function simpleMarkdownToHtml(md: string): string {
   const lines = md.split("\n");
   const out: string[] = [];
-  let inCode = false;
-  let inUl = false;
-
+  let inCode = false, inUl = false;
   for (const line of lines) {
     const trimmed = line.trim();
-
     if (trimmed.startsWith("```")) {
       if (inCode) { out.push("</code></pre>"); inCode = false; }
       else { if (inUl) { out.push("</ul>"); inUl = false; } out.push("<pre><code>"); inCode = true; }
@@ -277,7 +266,6 @@ function simpleMarkdownToHtml(md: string): string {
     }
     if (inCode) { out.push(escapeHtml(line)); continue; }
     if (inUl && !/^[-*] /.test(trimmed)) { out.push("</ul>"); inUl = false; }
-
     if (/^#{1,4} /.test(trimmed)) {
       const lvl = trimmed.match(/^(#+)/)?.[1].length ?? 2;
       out.push(`<h${lvl}>${inlineMarkdown(trimmed.replace(/^#+\s/, ""))}</h${lvl}>`);
@@ -295,232 +283,989 @@ function simpleMarkdownToHtml(md: string): string {
   return out.join("\n");
 }
 
-// ─── HTML layout ─────────────────────────────────────────────────────────────
+// ─── Global CSS ───────────────────────────────────────────────────────────────
 
-function htmlPage(title: string, body: string, activePath = ""): string {
-  const navLink = (href: string, label: string) =>
-    `<a href="${href}" ${activePath === href ? 'style="color:#f0f6fc;font-weight:bold;border-bottom:2px solid #58a6ff;padding-bottom:2px"' : ""}>${label}</a>`;
+const GLOBAL_CSS = `
+  :root {
+    --bg:          #0d1117;
+    --surface:     #161b22;
+    --surface-2:   #1c2128;
+    --surface-3:   #22272e;
+    --border:      #30363d;
+    --border-sub:  #21262d;
+    --text:        #e6edf3;
+    --text-muted:  #848d97;
+    --accent:      #58a6ff;
+    --accent-dim:  #1f4f99;
+    --success:     #3fb950;
+    --success-dim: #1a4a22;
+    --danger:      #f85149;
+    --danger-dim:  #5c1a1a;
+    --warning:     #d29922;
+    --warning-dim: #4a3500;
+    --radius:      8px;
+    --radius-sm:   4px;
+    --sidebar-w:   230px;
+    --font-mono:   'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    font-size: 14px;
+    min-height: 100vh;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ── Layout ──────────────────────────────────────────────────── */
+  .layout { display: flex; min-height: 100vh; }
+
+  .sidebar {
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    width: var(--sidebar-w);
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    z-index: 100;
+    overflow-y: auto;
+  }
+
+  .sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 18px 16px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--text);
+    flex-shrink: 0;
+  }
+
+  .brand-icon { font-size: 20px; }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--border);
+    margin-left: auto;
+    flex-shrink: 0;
+    transition: background 0.3s, box-shadow 0.3s;
+  }
+  .status-dot.active {
+    background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+    animation: pulse-dot 2.5s ease-in-out infinite;
+  }
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+  }
+
+  .sidebar-nav {
+    padding: 8px;
+    flex: 1;
+  }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    font-size: 13px;
+    transition: background 0.12s, color 0.12s;
+    margin-bottom: 1px;
+    cursor: pointer;
+  }
+  .nav-item:hover { background: var(--surface-2); color: var(--text); text-decoration: none; }
+  .nav-item.active { background: var(--surface-3); color: var(--text); font-weight: 500; }
+  .nav-icon { font-size: 14px; width: 18px; text-align: center; flex-shrink: 0; }
+
+  .sidebar-sep {
+    border: none;
+    border-top: 1px solid var(--border-sub);
+    margin: 6px 8px;
+  }
+
+  .sidebar-footer {
+    padding: 12px 16px;
+    border-top: 1px solid var(--border-sub);
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .main {
+    margin-left: var(--sidebar-w);
+    flex: 1;
+    padding: 28px 32px 60px;
+    max-width: 900px;
+  }
+
+  /* ── Typography ──────────────────────────────────────────────── */
+  h1 { font-size: 20px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+  h2 { font-size: 15px; font-weight: 600; color: var(--text); margin: 24px 0 10px;
+       padding-bottom: 6px; border-bottom: 1px solid var(--border-sub); }
+  h3 { font-size: 13px; font-weight: 600; color: var(--text); margin: 16px 0 8px; }
+  h4 { font-size: 12px; font-weight: 600; color: var(--text-muted); margin: 12px 0 6px; }
+  p  { margin: 6px 0; color: var(--text-muted); font-size: 13px; }
+  ul, ol { margin: 6px 0 6px 20px; }
+  li { margin: 3px 0; font-size: 13px; }
+  hr { border: none; border-top: 1px solid var(--border-sub); margin: 20px 0; }
+
+  .page-header { margin-bottom: 20px; }
+  .page-subtitle { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
+
+  /* ── Cards ───────────────────────────────────────────────────── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    margin: 12px 0;
+  }
+  .card-title {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+  }
+  .card-row {
+    display: flex;
+    gap: 10px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border-sub);
+    font-size: 13px;
+  }
+  .card-row:last-child { border-bottom: none; }
+  .card-label { color: var(--text-muted); min-width: 150px; flex-shrink: 0; }
+  .card-value { color: var(--text); word-break: break-all; }
+
+  /* ── Badges ──────────────────────────────────────────────────── */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  .badge-green  { background: var(--success-dim); color: var(--success); }
+  .badge-gray   { background: var(--surface-3); color: var(--text-muted); }
+  .badge-blue   { background: var(--accent-dim); color: var(--accent); }
+  .badge-red    { background: var(--danger-dim); color: var(--danger); }
+  .badge-yellow { background: var(--warning-dim); color: var(--warning); }
+
+  /* ── Code & Pre ──────────────────────────────────────────────── */
+  code {
+    background: var(--surface-2);
+    border: 1px solid var(--border-sub);
+    padding: 1px 5px;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  pre {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+    margin: 10px 0;
+    line-height: 1.5;
+  }
+  pre code { background: none; border: none; padding: 0; font-size: inherit; }
+
+  /* ── Tables ──────────────────────────────────────────────────── */
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13px; }
+  th { background: var(--surface-2); color: var(--text); padding: 7px 12px;
+       border: 1px solid var(--border); text-align: left; font-weight: 600; font-size: 12px; }
+  td { padding: 6px 12px; border: 1px solid var(--border-sub); color: var(--text); }
+  tr:nth-child(even) td { background: var(--surface-2); }
+
+  /* ── Form elements ───────────────────────────────────────────── */
+  .form-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    margin-bottom: 12px;
+  }
+  .form-section-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+  .form-row.single { grid-template-columns: 1fr; }
+  .form-row.triple { grid-template-columns: 1fr 1fr 1fr; }
+  .form-group { display: flex; flex-direction: column; gap: 4px; }
+  .form-group label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+  .form-group label span.required { color: var(--danger); margin-left: 2px; }
+
+  input[type="text"],
+  input[type="number"],
+  input[type="url"],
+  select,
+  textarea {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: 13px;
+    padding: 7px 10px;
+    font-family: inherit;
+    transition: border-color 0.15s;
+    width: 100%;
+    outline: none;
+  }
+  input[type="text"]:focus,
+  input[type="number"]:focus,
+  input[type="url"]:focus,
+  select:focus,
+  textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.12);
+  }
+  input::placeholder, textarea::placeholder { color: var(--text-muted); opacity: 0.6; }
+  select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23848d97'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; padding-right: 28px; cursor: pointer; }
+  textarea { min-height: 100px; resize: vertical; font-family: var(--font-mono); line-height: 1.5; }
+
+  .checkbox-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 8px;
+  }
+  .checkbox-label {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    cursor: pointer;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-sub);
+    background: var(--surface-2);
+    transition: border-color 0.12s, background 0.12s;
+  }
+  .checkbox-label:hover { border-color: var(--accent); background: var(--surface-3); }
+  .checkbox-label input[type="checkbox"] {
+    width: 14px; height: 14px;
+    margin-top: 1px;
+    accent-color: var(--accent);
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+  .checkbox-label .cb-text { display: flex; flex-direction: column; }
+  .checkbox-label .cb-name { font-size: 12px; font-weight: 500; color: var(--text); }
+  .checkbox-label .cb-desc { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
+
+  /* ── Buttons ─────────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-weight: 500;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: all 0.12s;
+    font-family: inherit;
+    white-space: nowrap;
+    text-decoration: none;
+  }
+  .btn-primary { background: var(--accent); color: #000; border-color: var(--accent); }
+  .btn-primary:hover { background: #79c0ff; border-color: #79c0ff; text-decoration: none; }
+  .btn-danger  { background: var(--danger-dim); color: var(--danger); border-color: #5c2b2b; }
+  .btn-danger:hover  { background: #7a1f1f; text-decoration: none; }
+  .btn-ghost   { background: transparent; color: var(--text-muted); border-color: var(--border); }
+  .btn-ghost:hover   { background: var(--surface-2); color: var(--text); text-decoration: none; }
+  .btn-sm      { padding: 5px 10px; font-size: 12px; }
+  .btn-launch  { padding: 10px 24px; font-size: 14px; font-weight: 600; letter-spacing: 0.02em; }
+
+  .btn-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+  /* ── Model fetch row ─────────────────────────────────────────── */
+  .input-row { display: flex; gap: 6px; }
+  .input-row input { flex: 1; }
+
+  /* ── Iteration history ───────────────────────────────────────── */
+  .iter-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border-sub);
+  }
+  .iter-row:last-child { border-bottom: none; }
+  .iter-num  { color: var(--text-muted); width: 28px; flex-shrink: 0; font-family: var(--font-mono); }
+  .iter-dur  { color: var(--text-muted); width: 55px; flex-shrink: 0; }
+  .iter-ok   { color: var(--success); width: 16px; flex-shrink: 0; }
+  .iter-fail { color: var(--danger);  width: 16px; flex-shrink: 0; }
+  .iter-tools { color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ── Misc ────────────────────────────────────────────────────── */
+  .empty-state {
+    color: var(--text-muted);
+    font-style: italic;
+    padding: 20px 0;
+    font-size: 13px;
+  }
+  .alert {
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    margin: 10px 0;
+  }
+  .alert-success { background: var(--success-dim); border: 1px solid #2a6030; color: var(--success); }
+  .alert-error   { background: var(--danger-dim);  border: 1px solid #6b2222; color: var(--danger); }
+  .alert-warning { background: var(--warning-dim); border: 1px solid #5a4000; color: var(--warning); }
+  .alert-info    { background: var(--accent-dim);  border: 1px solid #1a3a6e; color: var(--accent); }
+
+  .tag {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    background: var(--surface-3);
+    color: var(--text-muted);
+    border: 1px solid var(--border-sub);
+  }
+
+  details summary { cursor: pointer; color: var(--text-muted); font-size: 12px; user-select: none; }
+  details summary:hover { color: var(--text); }
+
+  .readme-body p[align=center], .readme-body div[align=center] { text-align: center; }
+  .readme-body h1[align=center], .readme-body h3[align=center] { text-align: center; }
+  .readme-body p { margin: 8px 0; color: var(--text); }
+`;
+
+// ─── HTML layout ──────────────────────────────────────────────────────────────
+
+function htmlPage(
+  title: string,
+  body: string,
+  activePath: string,
+  extraHead = "",
+  state?: Record<string, unknown> | null
+): string {
+  const isActive = state?.active === true;
+  const dotClass = isActive ? "status-dot active" : "status-dot";
+  const dotTitle = isActive ? `Active — iteration ${state?.iteration ?? "?"}` : "No active loop";
+
+  const navItem = (href: string, icon: string, label: string) => {
+    const cls = activePath === href ? "nav-item active" : "nav-item";
+    return `<a href="${href}" class="${cls}">
+      <span class="nav-icon">${icon}</span>
+      <span>${label}</span>
+    </a>`;
+  };
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(title)} — Ralph Dashboard</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.6; }
-    a { color: #58a6ff; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    nav { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 24px;
-          display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
-    nav strong { color: #f0f6fc; margin-right: 4px; font-size: 1.1em; }
-    nav .sep { color: #30363d; }
-    main { max-width: 960px; margin: 32px auto; padding: 0 24px 48px; }
-    h1, h2, h3, h4 { color: #f0f6fc; margin: 24px 0 10px; }
-    h1 { font-size: 1.6em; }
-    h2 { font-size: 1.25em; border-bottom: 1px solid #30363d; padding-bottom: 6px; margin-top: 32px; }
-    h3 { font-size: 1.05em; margin-top: 20px; }
-    h4 { font-size: 0.95em; margin-top: 16px; color: #8b949e; }
-    p { margin: 8px 0; }
-    ul, ol { margin: 8px 0 8px 24px; }
-    li { margin: 4px 0; }
-    hr { border: none; border-top: 1px solid #30363d; margin: 24px 0; }
-    table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 0.9em; }
-    th { background: #161b22; color: #f0f6fc; padding: 8px 12px; border: 1px solid #30363d; text-align: left; }
-    td { padding: 7px 12px; border: 1px solid #21262d; }
-    tr:nth-child(even) td { background: #161b22; }
-    pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px;
-          overflow-x: auto; font-size: 0.85em; white-space: pre-wrap; margin: 12px 0; }
-    code { background: #161b22; padding: 2px 6px; border-radius: 4px; font-size: 0.88em; }
-    pre code { background: none; padding: 0; font-size: inherit; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.8em; font-weight: bold; }
-    .badge-green { background: #1f6feb; color: #fff; }
-    .badge-gray  { background: #30363d; color: #8b949e; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin: 16px 0; }
-    .card-row { display: flex; gap: 8px; margin: 6px 0; }
-    .card-label { color: #8b949e; min-width: 160px; font-size: 0.9em; }
-    .card-value { color: #c9d1d9; }
-    textarea { width: 100%; min-height: 120px; background: #161b22; border: 1px solid #30363d;
-               border-radius: 6px; color: #c9d1d9; padding: 10px; font-family: monospace;
-               font-size: 0.9em; resize: vertical; }
-    button[type=submit] { margin-top: 12px; padding: 8px 20px; background: #238636; border: none;
-                          border-radius: 6px; color: #fff; cursor: pointer; font-size: 0.95em; }
-    button[type=submit]:hover { background: #2ea043; }
-    .iter-row { display: flex; gap: 12px; font-size: 0.85em; padding: 6px 0; border-bottom: 1px solid #21262d; }
-    .iter-num  { color: #8b949e; min-width: 36px; }
-    .success   { color: #3fb950; }
-    .failure   { color: #f85149; }
-    .empty-state { color: #8b949e; font-style: italic; padding: 16px 0; }
-    /* README-specific overrides */
-    .readme-body p[align=center], .readme-body div[align=center] { text-align: center; }
-    .readme-body h1[align=center], .readme-body h3[align=center] { text-align: center; }
-    .readme-body p { margin: 10px 0; }
-    details summary { cursor: pointer; color: #8b949e; }
-  </style>
+  <title>${escapeHtml(title)} — Ralph</title>
+  <style>${GLOBAL_CSS}</style>
+  ${extraHead}
 </head>
 <body>
-  <nav>
-    <strong>🎠 Ralph</strong>
-    <span class="sep">|</span>
-    ${navLink("/status", "Status")}
-    ${navLink("/plan", "Plan")}
-    ${navLink("/activity", "Activity")}
-    ${navLink("/logs", "Logs")}
-    ${navLink("/intervene", "Intervene")}
-    ${navLink("/readme", "Docs")}
-  </nav>
-  <main>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <span class="brand-icon">🎠</span>
+      <span>Ralph</span>
+      <span class="${dotClass}" id="status-dot" title="${dotTitle}"></span>
+    </div>
+    <nav class="sidebar-nav">
+      ${navItem("/launch", "⚡", "Launch")}
+      ${navItem("/status", "◉", "Status")}
+      <hr class="sidebar-sep">
+      ${navItem("/plan", "📋", "Plan")}
+      ${navItem("/activity", "📝", "Activity")}
+      ${navItem("/logs", "🗂", "Logs")}
+      <hr class="sidebar-sep">
+      ${navItem("/intervene", "✦", "Intervene")}
+      ${navItem("/readme", "📖", "Docs")}
+    </nav>
+    <div class="sidebar-footer">Ralph Wiggum</div>
+  </aside>
+  <main class="main">
     ${body}
   </main>
+</div>
 </body>
 </html>`;
 }
 
-// ─── Route handlers ──────────────────────────────────────────────────────────
+// ─── Route: Launch ────────────────────────────────────────────────────────────
+
+function routeLaunchGet(cwd: string, flash?: { type: string; message: string }): string {
+  const state = loadState(cwd);
+  const isActive = state?.active === true;
+
+  const agentWarning = isActive
+    ? `<div class="alert alert-warning">
+        ⚠ A loop is already running (iteration ${state?.iteration ?? "?"}). Launching another may cause conflicts.
+        <a href="/status" style="margin-left:8px">View Status →</a>
+       </div>`
+    : "";
+
+  const flashHtml = flash
+    ? `<div class="alert alert-${flash.type}">${escapeHtml(flash.message)}</div>`
+    : "";
+
+  return htmlPage("Launch", `
+    <div class="page-header">
+      <h1>⚡ Launch Ralph</h1>
+      <p class="page-subtitle">Start a new agentic loop with your chosen configuration.</p>
+    </div>
+    ${flashHtml}
+    ${agentWarning}
+
+    <form method="POST" action="/launch" id="launch-form">
+
+      <!-- PROMPT -->
+      <div class="form-section">
+        <div class="form-section-title">✏ Prompt</div>
+        <div class="form-group">
+          <label for="prompt">Task description<span class="required">*</span></label>
+          <textarea name="prompt" id="prompt" rows="6"
+            placeholder="e.g. Fix the failing tests in tests/auth.test.ts and make sure all assertions pass"></textarea>
+        </div>
+      </div>
+
+      <!-- AGENT & MODEL -->
+      <div class="form-section">
+        <div class="form-section-title">🤖 Agent &amp; Model</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="agent">Agent</label>
+            <select name="agent" id="agent">
+              <option value="">Default (opencode)</option>
+              <option value="opencode">opencode</option>
+              <option value="claude-code">claude-code</option>
+              <option value="codex">codex</option>
+              <option value="copilot">copilot</option>
+              <option value="aider">aider</option>
+              <option value="llm">llm (built-in)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="model">Model</label>
+            <input type="text" name="model" id="model"
+              placeholder="e.g. claude-sonnet-4-6, qwen2.5-coder:32b"
+              list="model-suggestions" autocomplete="off">
+            <datalist id="model-suggestions"></datalist>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="base-url">Base URL <span style="font-size:11px;font-weight:400;color:var(--text-muted)">(OpenAI-compatible, e.g. Ollama)</span></label>
+            <div class="input-row">
+              <input type="text" name="base-url" id="base-url"
+                placeholder="http://localhost:11434/v1">
+              <button type="button" class="btn btn-ghost btn-sm" id="fetch-models-btn"
+                onclick="fetchModels()" title="Fetch available models from the endpoint">↓ Models</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="rotation">Rotation <span style="font-size:11px;font-weight:400;color:var(--text-muted)">(cycle agents per iteration)</span></label>
+            <input type="text" name="rotation" id="rotation"
+              placeholder="opencode:claude-sonnet-4,claude-code:gpt-4o">
+          </div>
+        </div>
+      </div>
+
+      <!-- ITERATION CONTROL -->
+      <div class="form-section">
+        <div class="form-section-title">🔁 Iteration Control</div>
+        <div class="form-row triple">
+          <div class="form-group">
+            <label for="max-iterations">Max iterations</label>
+            <input type="number" name="max-iterations" id="max-iterations"
+              min="1" placeholder="unlimited">
+          </div>
+          <div class="form-group">
+            <label for="min-iterations">Min iterations</label>
+            <input type="number" name="min-iterations" id="min-iterations"
+              min="1" placeholder="1">
+          </div>
+          <div class="form-group">
+            <label for="max-prompt-tokens">Max prompt tokens</label>
+            <input type="number" name="max-prompt-tokens" id="max-prompt-tokens"
+              min="100" placeholder="unlimited">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="completion-promise">Completion signal</label>
+            <input type="text" name="completion-promise" id="completion-promise"
+              placeholder="COMPLETE">
+          </div>
+          <div class="form-group">
+            <label for="abort-promise">Abort signal</label>
+            <input type="text" name="abort-promise" id="abort-promise"
+              placeholder="GIVE_UP (optional)">
+          </div>
+        </div>
+      </div>
+
+      <!-- MODES -->
+      <div class="form-section">
+        <div class="form-section-title">🎛 Modes</div>
+        <div class="checkbox-grid">
+          <label class="checkbox-label">
+            <input type="checkbox" name="plan">
+            <span class="cb-text">
+              <span class="cb-name">--plan</span>
+              <span class="cb-desc">Maintain IMPLEMENTATION_PLAN.md</span>
+            </span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="tasks">
+            <span class="cb-text">
+              <span class="cb-name">--tasks</span>
+              <span class="cb-desc">Work through ralph-tasks.md checklist</span>
+            </span>
+          </label>
+          <label class="checkbox-label" id="optimize-label">
+            <input type="checkbox" name="optimize" id="optimize-cb">
+            <span class="cb-text">
+              <span class="cb-name">--optimize</span>
+              <span class="cb-desc">Minimal prompt for small/weak models</span>
+            </span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="diff">
+            <span class="cb-text">
+              <span class="cb-name">--diff</span>
+              <span class="cb-desc">Inject git diff into each iteration</span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <!-- OPTIONS -->
+      <div class="form-section">
+        <div class="form-section-title">⚙ Options</div>
+        <div class="checkbox-grid">
+          <label class="checkbox-label">
+            <input type="checkbox" name="allow-all" checked>
+            <span class="cb-text">
+              <span class="cb-name">--allow-all</span>
+              <span class="cb-desc">Auto-approve all permissions</span>
+            </span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="no-commit">
+            <span class="cb-text">
+              <span class="cb-name">--no-commit</span>
+              <span class="cb-desc">Skip auto-commit after each iteration</span>
+            </span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="no-plugins">
+            <span class="cb-text">
+              <span class="cb-name">--no-plugins</span>
+              <span class="cb-desc">Disable OpenCode plugins</span>
+            </span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="no-stream">
+            <span class="cb-text">
+              <span class="cb-name">--no-stream</span>
+              <span class="cb-desc">Buffer output, print at end</span>
+            </span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="verbose-tools">
+            <span class="cb-text">
+              <span class="cb-name">--verbose-tools</span>
+              <span class="cb-desc">Print every tool call in detail</span>
+            </span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" name="no-questions">
+            <span class="cb-text">
+              <span class="cb-name">--no-questions</span>
+              <span class="cb-desc">Disable interactive questions</span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <!-- ADVANCED -->
+      <div class="form-section">
+        <div class="form-section-title">🔧 Advanced</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="preset">Preset name</label>
+            <input type="text" name="preset" id="preset"
+              placeholder="Load from .ralph/presets.json">
+          </div>
+          <div class="form-group">
+            <label for="cwd">Project directory</label>
+            <input type="text" name="cwd" id="cwd"
+              value="${escapeHtml(cwd)}"
+              placeholder="${escapeHtml(cwd)}">
+          </div>
+        </div>
+      </div>
+
+      <!-- SUBMIT -->
+      <div class="btn-row" style="margin-top:4px">
+        <button type="submit" class="btn btn-primary btn-launch" id="launch-btn">⚡ Launch Ralph</button>
+        <a href="/status" class="btn btn-ghost">View Status</a>
+      </div>
+
+    </form>
+
+    <script>
+      // Disable optimize for agents other than llm
+      const agentSel = document.getElementById('agent');
+      const optimizeLabel = document.getElementById('optimize-label');
+      function updateOptimize() {
+        const v = agentSel.value;
+        const dim = v !== '' && v !== 'llm';
+        optimizeLabel.style.opacity = dim ? '0.4' : '1';
+        optimizeLabel.querySelector('input').disabled = dim;
+      }
+      agentSel.addEventListener('change', updateOptimize);
+      updateOptimize();
+
+      // Fetch Ollama models
+      async function fetchModels() {
+        const url = document.getElementById('base-url').value.trim();
+        if (!url) { alert('Enter a Base URL first (e.g. http://localhost:11434/v1)'); return; }
+        const btn = document.getElementById('fetch-models-btn');
+        btn.textContent = '⏳ Fetching…';
+        btn.disabled = true;
+        try {
+          const resp = await fetch('/api/models?url=' + encodeURIComponent(url));
+          const models = await resp.json();
+          const dl = document.getElementById('model-suggestions');
+          dl.innerHTML = '';
+          if (models.length === 0) { alert('No models found at that URL.'); return; }
+          models.forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m;
+            dl.appendChild(opt);
+          });
+          btn.textContent = '✓ ' + models.length + ' models';
+        } catch (e) {
+          alert('Failed to fetch models: ' + e.message);
+          btn.textContent = '↓ Models';
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      // Confirm if a loop is already active
+      document.getElementById('launch-form').addEventListener('submit', function(e) {
+        const hasWarning = document.querySelector('.alert-warning');
+        if (hasWarning) {
+          if (!confirm('A loop is already running. Launch another anyway?')) {
+            e.preventDefault();
+          }
+        }
+      });
+    </script>
+  `, "/launch", "", state);
+}
+
+// ─── Route: Status ────────────────────────────────────────────────────────────
 
 function routeStatus(cwd: string): string {
   const state = loadState(cwd);
   const history = loadHistory(cwd);
+  const hasPid = existsSync(pidPath(cwd));
+  const isActive = state?.active === true;
 
   let statusBadge = `<span class="badge badge-gray">No active loop</span>`;
-  let stateHtml = `<p class="empty-state">No active Ralph loop detected.</p>`;
+  let stateHtml = `<p class="empty-state">No active Ralph loop found. Use <a href="/launch">Launch</a> to start one.</p>`;
 
-  if (state && state.active) {
-    const started = String(state.startedAt ?? "");
+  if (isActive) {
+    const started = String(state!.startedAt ?? "");
     const elapsed = started ? Math.floor((Date.now() - new Date(started).getTime()) / 1000) : 0;
     const elapsedStr = elapsed > 3600
       ? `${Math.floor(elapsed / 3600)}h ${Math.floor((elapsed % 3600) / 60)}m`
       : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
 
-    statusBadge = `<span class="badge badge-green">ACTIVE</span>`;
+    statusBadge = `<span class="badge badge-green">● ACTIVE</span>`;
+    const rowOf = (label: string, val: string, code = false) =>
+      `<div class="card-row"><span class="card-label">${label}</span><span class="card-value">${code ? `<code>${val}</code>` : val}</span></div>`;
+
     stateHtml = `
       <div class="card">
-        <div class="card-row"><span class="card-label">Iteration</span><span class="card-value">${escapeHtml(String(state.iteration ?? "?"))}${state.maxIterations ? ` / ${state.maxIterations}` : " (unlimited)"}</span></div>
-        <div class="card-row"><span class="card-label">Started</span><span class="card-value">${escapeHtml(started)}</span></div>
-        <div class="card-row"><span class="card-label">Elapsed</span><span class="card-value">${elapsedStr}</span></div>
-        <div class="card-row"><span class="card-label">Agent</span><span class="card-value">${escapeHtml(String(state.agent ?? "unknown"))}</span></div>
-        ${state.model   ? `<div class="card-row"><span class="card-label">Model</span><span class="card-value">${escapeHtml(String(state.model))}</span></div>` : ""}
-        ${state.baseUrl ? `<div class="card-row"><span class="card-label">Base URL</span><span class="card-value">${escapeHtml(String(state.baseUrl))}</span></div>` : ""}
-        <div class="card-row"><span class="card-label">Completion Promise</span><span class="card-value"><code>${escapeHtml(String(state.completionPromise ?? "COMPLETE"))}</code></span></div>
-        ${state.tasksMode ? `<div class="card-row"><span class="card-label">Tasks Mode</span><span class="card-value"><span class="badge badge-green">ENABLED</span></span></div>` : ""}
-        ${state.planMode  ? `<div class="card-row"><span class="card-label">Plan Mode</span><span class="card-value"><span class="badge badge-green">ENABLED</span></span></div>` : ""}
-        <div class="card-row"><span class="card-label">Prompt</span><span class="card-value">${escapeHtml(String(state.prompt ?? "").substring(0, 120))}${String(state.prompt ?? "").length > 120 ? "…" : ""}</span></div>
+        ${rowOf("Iteration", `${state!.iteration ?? "?"}${state!.maxIterations ? ` / ${state!.maxIterations}` : " (unlimited)"}`)}
+        ${rowOf("Agent", escapeHtml(String(state!.agent ?? "unknown")))}
+        ${state!.model   ? rowOf("Model",    escapeHtml(String(state!.model)), true) : ""}
+        ${state!.baseUrl ? rowOf("Base URL", escapeHtml(String(state!.baseUrl)), true) : ""}
+        ${rowOf("Started",  escapeHtml(started))}
+        ${rowOf("Elapsed",  elapsedStr)}
+        ${rowOf("Completion signal", escapeHtml(String(state!.completionPromise ?? "COMPLETE")), true)}
+        ${state!.planMode  ? rowOf("Plan mode",  '<span class="badge badge-blue">ON</span>') : ""}
+        ${state!.tasksMode ? rowOf("Tasks mode", '<span class="badge badge-blue">ON</span>') : ""}
+        ${rowOf("Prompt", escapeHtml(String(state!.prompt ?? "").substring(0, 160)) + (String(state!.prompt ?? "").length > 160 ? "…" : ""))}
       </div>`;
   }
 
   let historyHtml = `<p class="empty-state">No iteration history yet.</p>`;
   if (history && Array.isArray((history as { iterations?: unknown[] }).iterations)) {
-    const iters = (history as { iterations: Record<string, unknown>[] }).iterations.slice(-10).reverse();
+    const iters = (history as { iterations: Record<string, unknown>[] }).iterations.slice(-15).reverse();
     if (iters.length > 0) {
-      historyHtml = iters.map(it => {
+      historyHtml = `<div class="card" style="padding:12px 16px">` + iters.map(it => {
         const sec = Math.floor(Number(it.durationMs ?? 0) / 1000);
         const dur = sec > 60 ? `${Math.floor(sec / 60)}m ${sec % 60}s` : `${sec}s`;
         const ok = it.completionDetected;
         const tools = Object.entries(it.toolsUsed as Record<string, number> ?? {})
-          .sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => `${k}(${v})`).join(" ") || "—";
+          .sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, v]) => `${k}×${v}`).join(" ") || "—";
         return `<div class="iter-row">
           <span class="iter-num">#${it.iteration}</span>
-          <span style="min-width:70px">${dur}</span>
-          <span class="${ok ? "success" : "failure"}" style="min-width:20px">${ok ? "✓" : "✗"}</span>
-          <span style="color:#8b949e">${escapeHtml(tools)}</span>
+          <span class="iter-dur">${dur}</span>
+          <span class="${ok ? "iter-ok" : "iter-fail"}">${ok ? "✓" : "✗"}</span>
+          <span class="iter-tools">${escapeHtml(tools)}</span>
         </div>`;
-      }).join("\n");
+      }).join("") + `</div>`;
     }
   }
 
+  const stopBtn = hasPid
+    ? `<form method="POST" action="/stop" style="display:inline">
+         <button type="submit" class="btn btn-danger btn-sm"
+           onclick="return confirm('Stop the running Ralph loop?')">⏹ Stop Loop</button>
+       </form>`
+    : "";
+
+  const extraHead = isActive
+    ? `<script>
+        setInterval(async () => {
+          try {
+            const r = await fetch('/api/status');
+            const s = await r.json();
+            // Update status dot
+            const dot = document.getElementById('status-dot');
+            if (dot) {
+              dot.className = s.active ? 'status-dot active' : 'status-dot';
+              dot.title = s.active ? 'Active — iteration ' + (s.iteration ?? '?') : 'No active loop';
+            }
+            // If no longer active, stop polling and refresh page
+            if (!s.active) { window.location.reload(); }
+            else {
+              const itEl = document.getElementById('iter-display');
+              if (itEl) itEl.textContent = (s.iteration ?? '?') + (s.maxIterations ? ' / ' + s.maxIterations : ' (unlimited)');
+            }
+          } catch {}
+        }, 5000);
+      </script>`
+    : "";
+
   return htmlPage("Status", `
-    <h1>Loop Status ${statusBadge}</h1>
+    <div class="page-header">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <h1>Loop Status ${statusBadge}</h1>
+        ${stopBtn}
+        <button class="btn btn-ghost btn-sm" onclick="location.reload()">↻ Refresh</button>
+      </div>
+    </div>
     ${stateHtml}
     <h2>Recent Iterations</h2>
     ${historyHtml}
-  `, "/status");
+  `, "/status", extraHead, state);
 }
+
+// ─── Route: Plan ─────────────────────────────────────────────────────────────
 
 function routePlan(cwd: string): string {
+  const state = loadState(cwd);
   const p = planPath(cwd);
   if (!existsSync(p)) {
-    return htmlPage("Plan", `<h1>IMPLEMENTATION_PLAN.md</h1>
-      <p class="empty-state">No <code>IMPLEMENTATION_PLAN.md</code> found in project root.
-      Run ralph with <code>--plan</code> to have the agent create one.</p>`, "/plan");
+    return htmlPage("Plan", `
+      <div class="page-header"><h1>📋 Implementation Plan</h1></div>
+      <p class="empty-state">No <code>IMPLEMENTATION_PLAN.md</code> found. Run Ralph with <code>--plan</code> to have the agent create one.</p>
+    `, "/plan", "", state);
   }
   const content = readFileSafe(p);
-  return htmlPage("Plan",
-    `<h1>IMPLEMENTATION_PLAN.md</h1><div class="card">${simpleMarkdownToHtml(content)}</div>`,
-    "/plan");
+  return htmlPage("Plan", `
+    <div class="page-header">
+      <h1>📋 Implementation Plan</h1>
+      <p class="page-subtitle">IMPLEMENTATION_PLAN.md — maintained by the agent</p>
+    </div>
+    <div class="card">${simpleMarkdownToHtml(content)}</div>
+  `, "/plan", "", state);
 }
+
+// ─── Route: Activity ─────────────────────────────────────────────────────────
 
 function routeActivity(cwd: string): string {
+  const state = loadState(cwd);
   const p = activityPath(cwd);
   if (!existsSync(p)) {
-    return htmlPage("Activity", `<h1>activity.md</h1>
-      <p class="empty-state">No <code>activity.md</code> found.
-      Run ralph with <code>--plan</code> to have the agent create it.</p>`, "/activity");
+    return htmlPage("Activity", `
+      <div class="page-header"><h1>📝 Activity Log</h1></div>
+      <p class="empty-state">No <code>activity.md</code> found. Run Ralph with <code>--plan</code> to have the agent maintain an activity log.</p>
+    `, "/activity", "", state);
   }
-  const content = lastNLines(readFileSafe(p), 100);
-  return htmlPage("Activity",
-    `<h1>activity.md <small style="color:#8b949e;font-size:0.7em">(last 100 lines)</small></h1>
-     <pre>${escapeHtml(content)}</pre>`,
-    "/activity");
+  const content = lastNLines(readFileSafe(p), 120);
+  const isActive = state?.active === true;
+  const extra = isActive
+    ? `<script>setTimeout(() => location.reload(), 10000);</script>`
+    : "";
+  return htmlPage("Activity", `
+    <div class="page-header">
+      <div style="display:flex;align-items:center;gap:12px">
+        <h1>📝 Activity Log</h1>
+        <button class="btn btn-ghost btn-sm" onclick="location.reload()">↻ Refresh</button>
+        ${isActive ? `<span class="badge badge-green">● Live</span>` : ""}
+      </div>
+      <p class="page-subtitle">activity.md — last 120 lines</p>
+    </div>
+    <pre id="activity-log">${escapeHtml(content)}</pre>
+  `, "/activity", extra, state);
 }
 
+// ─── Route: Logs ──────────────────────────────────────────────────────────────
+
 function routeLogs(cwd: string): string {
+  const state = loadState(cwd);
   const history = loadHistory(cwd);
   if (!history || !Array.isArray((history as { iterations?: unknown[] }).iterations)) {
-    return htmlPage("Logs", `<h1>Iteration Logs</h1><p class="empty-state">No history yet.</p>`, "/logs");
+    return htmlPage("Logs", `
+      <div class="page-header"><h1>🗂 Iteration Logs</h1></div>
+      <p class="empty-state">No history yet.</p>
+    `, "/logs", "", state);
   }
   const iters = (history as { iterations: Record<string, unknown>[] }).iterations.slice(-10).reverse();
   if (iters.length === 0) {
-    return htmlPage("Logs", `<h1>Iteration Logs</h1><p class="empty-state">No iterations recorded.</p>`, "/logs");
+    return htmlPage("Logs", `
+      <div class="page-header"><h1>🗂 Iteration Logs</h1></div>
+      <p class="empty-state">No iterations recorded.</p>
+    `, "/logs", "", state);
   }
 
   const cards = iters.map(it => {
     const sec = Math.floor(Number(it.durationMs ?? 0) / 1000);
     const dur = sec > 60 ? `${Math.floor(sec / 60)}m ${sec % 60}s` : `${sec}s`;
     const tools = JSON.stringify(it.toolsUsed ?? {}, null, 2);
-    const files = Array.isArray(it.filesModified) ? (it.filesModified as string[]).join(", ") || "none" : "none";
+    const files = Array.isArray(it.filesModified)
+      ? (it.filesModified as string[]).map(f => `<code>${escapeHtml(f)}</code>`).join(" ") || "none"
+      : "none";
     const errors = Array.isArray(it.errors) ? (it.errors as string[]).join("\n") : "";
+    const ok = it.completionDetected;
     return `<div class="card">
-      <h3>Iteration #${it.iteration}
-        <span class="${it.completionDetected ? "success" : "failure"}">
-          ${it.completionDetected ? "✓ completed" : "✗ not completed"}
-        </span>
-      </h3>
-      <div class="card-row"><span class="card-label">Duration</span><span class="card-value">${dur}</span></div>
-      <div class="card-row"><span class="card-label">Agent / Model</span><span class="card-value">${escapeHtml(String(it.agent ?? "?"))} / ${escapeHtml(String(it.model ?? "?"))}</span></div>
-      <div class="card-row"><span class="card-label">Exit Code</span><span class="card-value">${it.exitCode}</span></div>
-      <div class="card-row"><span class="card-label">Files Modified</span><span class="card-value">${escapeHtml(files)}</span></div>
-      ${errors ? `<div class="card-row"><span class="card-label">Errors</span><span class="card-value"><pre style="margin:0">${escapeHtml(errors)}</pre></span></div>` : ""}
-      <details style="margin-top:12px"><summary>Tool usage</summary><pre>${escapeHtml(tools)}</pre></details>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+        <span style="font-size:15px;font-weight:600;color:var(--text)">Iteration #${it.iteration}</span>
+        ${ok ? '<span class="badge badge-green">✓ completed</span>' : '<span class="badge badge-red">✗ not completed</span>'}
+      </div>
+      <div class="card-row">
+        <span class="card-label">Duration</span>
+        <span class="card-value">${dur}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Agent / Model</span>
+        <span class="card-value"><code>${escapeHtml(String(it.agent ?? "?"))}</code> / <code>${escapeHtml(String(it.model ?? "?"))}</code></span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Exit code</span>
+        <span class="card-value"><code>${it.exitCode}</code></span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Files modified</span>
+        <span class="card-value" style="font-size:12px">${files}</span>
+      </div>
+      ${errors ? `<div class="card-row">
+        <span class="card-label">Errors</span>
+        <span class="card-value"><pre style="margin:0;font-size:11px">${escapeHtml(errors)}</pre></span>
+      </div>` : ""}
+      <details style="margin-top:10px">
+        <summary>Tool usage</summary>
+        <pre style="margin-top:6px">${escapeHtml(tools)}</pre>
+      </details>
     </div>`;
   }).join("\n");
 
-  return htmlPage("Logs",
-    `<h1>Iteration Logs <small style="color:#8b949e;font-size:0.7em">(last 10)</small></h1>${cards}`,
-    "/logs");
+  return htmlPage("Logs", `
+    <div class="page-header">
+      <h1>🗂 Iteration Logs</h1>
+      <p class="page-subtitle">Last 10 iterations</p>
+    </div>
+    ${cards}
+  `, "/logs", "", state);
 }
 
-function routeInterveneGet(cwd: string): string {
+// ─── Route: Intervene ─────────────────────────────────────────────────────────
+
+function routeInterveneGet(cwd: string, flash?: { type: string; message: string }): string {
+  const state = loadState(cwd);
   const current = loadContext(cwd);
-  const currentHtml = current
-    ? `<div class="card"><h3>Pending context (injected into next iteration):</h3><pre>${escapeHtml(current)}</pre></div>`
-    : `<p class="empty-state">No pending context note.</p>`;
+  const flashHtml = flash
+    ? `<div class="alert alert-${flash.type}">${escapeHtml(flash.message)}</div>`
+    : "";
+
+  const pendingHtml = current
+    ? `<div class="alert alert-info">⏳ Pending context note — will be injected into the next iteration then cleared automatically.</div>
+       <pre style="margin-bottom:16px">${escapeHtml(current)}</pre>`
+    : `<p style="color:var(--text-muted);margin-bottom:16px;font-size:13px">No pending context note.</p>`;
 
   return htmlPage("Intervene", `
-    <h1>Intervene</h1>
-    <p>Add a note to <code>.ralph/ralph-context.md</code> — it will be injected into
-       the next iteration's prompt, then cleared automatically.</p>
-    ${currentHtml}
-    <div class="card">
+    <div class="page-header">
+      <h1>✦ Intervene</h1>
+      <p class="page-subtitle">Inject a context note into the next iteration's prompt, then it's cleared automatically.</p>
+    </div>
+    ${flashHtml}
+    ${pendingHtml}
+    <div class="form-section">
+      <div class="form-section-title">Context note</div>
       <form method="POST" action="/intervene">
-        <label for="ctx"><strong>Context note:</strong></label><br><br>
-        <textarea name="context" id="ctx"
-          placeholder="e.g. The test failure is in tests/auth.test.ts line 42. Try the singleton pattern."
-          >${escapeHtml(current)}</textarea>
-        <button type="submit">Save context</button>
+        <div class="form-group" style="margin-bottom:12px">
+          <textarea name="context" rows="6"
+            placeholder="e.g. The test failure is in tests/auth.test.ts line 42. Try using the singleton pattern instead of a new instance each call."
+            >${escapeHtml(current)}</textarea>
+        </div>
+        <div class="btn-row">
+          <button type="submit" class="btn btn-primary">Save context note</button>
+          ${current ? `<button type="submit" formaction="/intervene/clear" class="btn btn-ghost">Clear</button>` : ""}
+        </div>
       </form>
     </div>
-  `, "/intervene");
+  `, "/intervene", "", state);
 }
 
 async function routeIntervenePost(req: Request, cwd: string): Promise<Response> {
@@ -530,28 +1275,95 @@ async function routeIntervenePost(req: Request, cwd: string): Promise<Response> 
   const dir = stateDir(cwd);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "ralph-context.md"), context.trim());
-  return new Response(null, { status: 302, headers: { Location: "/intervene" } });
+  return new Response(null, { status: 302, headers: { Location: "/intervene?saved=1" } });
 }
 
-function routeReadme(): string {
+function routeInterveneClear(cwd: string): Response {
+  const p = contextPath(cwd);
+  if (existsSync(p)) writeFileSync(p, "");
+  return new Response(null, { status: 302, headers: { Location: "/intervene?cleared=1" } });
+}
+
+// ─── Route: README ────────────────────────────────────────────────────────────
+
+function routeReadme(cwd: string): string {
+  const state = loadState(cwd);
   if (!existsSync(RALPH_README_PATH)) {
     return htmlPage("Docs", `
-      <h1>README not found</h1>
-      <p class="empty-state">Could not find <code>README.md</code> at:<br>
-        <code>${escapeHtml(RALPH_README_PATH)}</code>
-      </p>`, "/readme");
+      <div class="page-header"><h1>📖 Docs</h1></div>
+      <p class="empty-state">README.md not found at <code>${escapeHtml(RALPH_README_PATH)}</code></p>
+    `, "/readme", "", state);
   }
-
   const raw = readFileSafe(RALPH_README_PATH);
-  const body = `
-    <div class="readme-body">
-      <p style="color:#8b949e;font-size:0.85em;margin-bottom:24px">
-        Source: <code>${escapeHtml(RALPH_README_PATH)}</code>
-      </p>
-      ${markdownToHtml(raw)}
-    </div>`;
+  return htmlPage("Docs", `
+    <div class="page-header">
+      <h1>📖 Docs</h1>
+      <p class="page-subtitle">Ralph Wiggum — README</p>
+    </div>
+    <div class="readme-body card">${markdownToHtml(raw)}</div>
+  `, "/readme", "", state);
+}
 
-  return htmlPage("Docs", body, "/readme");
+// ─── Route: POST /launch ──────────────────────────────────────────────────────
+
+async function routeLaunchPost(req: Request, cwd: string): Promise<Response> {
+  let body = "";
+  try { body = await req.text(); } catch {
+    return new Response("Bad request", { status: 400 });
+  }
+  const formData = new URLSearchParams(body);
+  const error = await launchRalph(formData, cwd);
+  if (error) {
+    const html = routeLaunchGet(cwd, { type: "error", message: error });
+    return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+  return new Response(null, { status: 302, headers: { Location: "/status" } });
+}
+
+// ─── Route: POST /stop ────────────────────────────────────────────────────────
+
+async function routeStop(cwd: string): Promise<Response> {
+  const ok = await stopRalph(cwd);
+  if (!ok) {
+    return new Response(null, { status: 302, headers: { Location: "/status?stop_error=1" } });
+  }
+  return new Response(null, { status: 302, headers: { Location: "/status?stopped=1" } });
+}
+
+// ─── Route: GET /api/status ───────────────────────────────────────────────────
+
+function routeApiStatus(cwd: string): Response {
+  const state = loadState(cwd);
+  return new Response(JSON.stringify(state ?? { active: false }), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// ─── Route: GET /api/models ───────────────────────────────────────────────────
+
+async function routeApiModels(req: Request): Promise<Response> {
+  const url = new URL(req.url).searchParams.get("url") ?? "";
+  if (!url) {
+    return new Response(JSON.stringify([]), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  const base = url.replace(/\/+$/, "").replace(/\/v1$/, "");
+  try {
+    const resp = await fetch(`${base}/api/tags`, {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json() as { models?: Array<{ name: string }> };
+    const models = (data.models ?? []).map(m => m.name);
+    return new Response(JSON.stringify(models), {
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify([]), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -560,40 +1372,57 @@ export async function startDashboard(port: number, openBrowser: boolean, cwd: st
   const server = Bun.serve({
     port,
     async fetch(req: Request): Promise<Response> {
-      const path = new URL(req.url).pathname;
+      const url = new URL(req.url);
+      const path = url.pathname;
       const html = (s: string) => new Response(s, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+      const q = url.searchParams;
 
-      if (path === "/" || path === "")    return new Response(null, { status: 302, headers: { Location: "/status" } });
+      if (path === "/" || path === "")    return new Response(null, { status: 302, headers: { Location: "/launch" } });
+      if (path === "/launch") {
+        if (req.method === "POST") return routeLaunchPost(req, cwd);
+        let flash: { type: string; message: string } | undefined;
+        if (q.get("error"))   flash = { type: "error",   message: q.get("error")! };
+        return html(routeLaunchGet(cwd, flash));
+      }
       if (path === "/status")             return html(routeStatus(cwd));
       if (path === "/plan")               return html(routePlan(cwd));
       if (path === "/activity")           return html(routeActivity(cwd));
       if (path === "/logs")               return html(routeLogs(cwd));
-      if (path === "/readme")             return html(routeReadme());
+      if (path === "/readme")             return html(routeReadme(cwd));
       if (path === "/intervene") {
         if (req.method === "POST") return routeIntervenePost(req, cwd);
-        return html(routeInterveneGet(cwd));
+        let flash: { type: string; message: string } | undefined;
+        if (q.get("saved"))   flash = { type: "success", message: "Context note saved. It will be injected into the next iteration." };
+        if (q.get("cleared")) flash = { type: "success", message: "Context note cleared." };
+        return html(routeInterveneGet(cwd, flash));
       }
+      if (path === "/intervene/clear")    return routeInterveneClear(cwd);
+      if (path === "/stop" && req.method === "POST") return routeStop(cwd);
+      if (path === "/api/status")         return routeApiStatus(cwd);
+      if (path === "/api/models")         return routeApiModels(req);
+
       return new Response("Not Found", { status: 404 });
     },
   });
 
   console.log(`\n╔══════════════════════════════════════════════════════════════════╗`);
-  console.log(`║           Ralph Dashboard running                               ║`);
+  console.log(`║           Ralph Dashboard                                        ║`);
   console.log(`║  http://localhost:${port}${" ".repeat(Math.max(0, 46 - String(port).length))}║`);
   console.log(`╚══════════════════════════════════════════════════════════════════╝`);
+  console.log(`  /launch    — compose & start a new Ralph loop`);
   console.log(`  /status    — active loop state & iteration history`);
   console.log(`  /plan      — IMPLEMENTATION_PLAN.md viewer`);
-  console.log(`  /activity  — activity.md log (last 100 lines)`);
-  console.log(`  /logs      — detailed iteration logs`);
+  console.log(`  /activity  — activity.md log (last 120 lines)`);
+  console.log(`  /logs      — detailed per-iteration logs`);
   console.log(`  /intervene — inject a context note into the next iteration`);
-  console.log(`  /readme    — how ralph works, all commands & examples`);
+  console.log(`  /readme    — documentation`);
   console.log(`\nPress Ctrl+C to stop.`);
 
   if (openBrowser) {
-    const url = `http://localhost:${port}/status`;
-    const cmd = process.platform === "win32" ? ["cmd", "/c", "start", url]
-              : process.platform === "darwin" ? ["open", url]
-              : ["xdg-open", url];
+    const launchUrl = `http://localhost:${port}/launch`;
+    const cmd = process.platform === "win32" ? ["cmd", "/c", "start", launchUrl]
+              : process.platform === "darwin" ? ["open", launchUrl]
+              : ["xdg-open", launchUrl];
     try { Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" }); } catch { /* best-effort */ }
   }
 
