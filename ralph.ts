@@ -13,6 +13,9 @@ import { checkTerminalPromise, checkAnywhereInOutput, stripAnsi, tasksMarkdownAl
 
 const VERSION = "1.2.3";
 
+// Directory of this script — used to locate bundled helper scripts (e.g. llm-agent.ts)
+const RALPH_DIR = import.meta.dir;
+
 // Detect Windows platform for command resolution
 const IS_WINDOWS = process.platform === "win32";
 
@@ -37,7 +40,7 @@ const questionsPath = join(stateDir, "ralph-questions.json");
 let customConfigPath = "";
 let initConfigPath = "";
 
-const AGENT_TYPES = ["opencode", "claude-code", "codex", "copilot", "aider"] as const;
+const AGENT_TYPES = ["opencode", "claude-code", "codex", "copilot", "aider", "llm"] as const;
 type AgentType = (typeof AGENT_TYPES)[number];
 
 type AgentEnvOptions = { filterPlugins?: boolean; allowAllPermissions?: boolean; baseUrl?: string; model?: string };
@@ -126,6 +129,11 @@ const defaultParseToolOutput = (line: string): string | null => {
 
 PARSE_PATTERNS["codex"] = defaultParseToolOutput;
 PARSE_PATTERNS["copilot"] = defaultParseToolOutput;
+PARSE_PATTERNS["llm"] = (line) => {
+  // llm-agent.ts emits "[file] path/to/file" markers for each file it writes
+  const match = stripAnsi(line).match(/^\[file\]\s+(.+)/);
+  return match ? match[1] : null;
+};
 
 const ARGS_TEMPLATES: Record<string, (prompt: string, model: string, options?: AgentBuildArgsOptions) => string[]> = {
   "opencode": (prompt, model, options) => {
@@ -181,6 +189,14 @@ const ARGS_TEMPLATES: Record<string, (prompt: string, model: string, options?: A
     if (options?.extraFlags?.length) cmdArgs.push(...options.extraFlags);
     return cmdArgs;
   },
+  "llm": (prompt, model, options) => {
+    const scriptPath = join(RALPH_DIR, "llm-agent.ts");
+    const cmdArgs = [scriptPath, "--message", prompt];
+    if (model) cmdArgs.push("--model", model);
+    if (options?.baseUrl) cmdArgs.push("--base-url", options.baseUrl);
+    if (options?.extraFlags?.length) cmdArgs.push(...options.extraFlags);
+    return cmdArgs;
+  },
   "default": (prompt, model, options) => {
     const cmdArgs: string[] = [];
     if (model) cmdArgs.push("--model", model);
@@ -209,6 +225,14 @@ const ENV_TEMPLATES: Record<string, (options: AgentEnvOptions) => Record<string,
     // Aider requires OPENAI_API_KEY to be set; use a placeholder for local models
     if (!env.OPENAI_API_KEY) env.OPENAI_API_KEY = "local";
     if (options.baseUrl) env.OPENAI_API_BASE = options.baseUrl;
+    return env;
+  },
+  "llm": (options) => {
+    const env: Record<string, string> = { ...process.env };
+    // For local servers no real key is needed; set a placeholder so llm-agent.ts
+    // doesn't fall back to the OpenAI default.
+    if (!env.OPENAI_API_KEY && options.baseUrl) env.OPENAI_API_KEY = "local";
+    if (options.baseUrl) env.OPENAI_BASE_URL = options.baseUrl;
     return env;
   },
   "default": () => ({ ...process.env }),
@@ -351,6 +375,14 @@ const BUILT_IN_AGENTS: Record<AgentType, AgentConfig> = {
     // so the promise tag is never the final line. Scan the full output instead.
     completionCheck: "anywhere",
   },
+  "llm": {
+    type: "llm",
+    command: "bun",
+    buildArgs: ARGS_TEMPLATES["llm"],
+    buildEnv: ENV_TEMPLATES["llm"],
+    parseToolOutput: PARSE_PATTERNS["llm"],
+    configName: "LLM Agent",
+  },
 };
 
 // Parse arguments early for --config and --init-config handling
@@ -403,7 +435,7 @@ Arguments:
   prompt              Task description for the AI to work on
 
 ── Core Options ────────────────────────────────────────────────────────────────
-  --agent AGENT       AI agent to use: opencode (default), claude-code, codex, copilot, aider
+  --agent AGENT       AI agent to use: opencode (default), claude-code, codex, copilot, aider, llm
   --model MODEL       Model to use (agent-specific, e.g., anthropic/claude-sonnet)
   --min-iterations N  Minimum iterations before completion allowed (default: 1)
   --max-iterations N  Maximum iterations before stopping (default: unlimited)
@@ -430,7 +462,10 @@ Arguments:
 
 ── Local / OpenAI-compatible Models ─────────────────────────────────────────────
   --base-url URL      Base URL for OpenAI-compatible APIs (e.g., http://localhost:11434/v1)
-                      Example: ralph "task" --agent aider --model ollama/qwen2.5-coder \\
+                      With --agent opencode: auto-registers the provider in opencode's config
+                      With --agent llm: calls the API directly (no extra tools needed)
+                      With --agent aider: passes --openai-api-base to aider
+                      Example: ralph "task" --agent llm --model qwen2.5-coder \\
                                             --base-url http://localhost:11434/v1
 
 ── Output & Permissions ─────────────────────────────────────────────────────────
@@ -469,7 +504,7 @@ Arguments:
   ralph "Add tests" --completion-promise "ALL TESTS PASS" --model openai/gpt-5.1
   ralph "Build feature" --plan                              # enable plan mode
   ralph --init-presets && ralph --preset example            # use a preset
-  ralph "Fix the bug" --agent aider --model ollama/qwen2.5-coder \\
+  ralph "Fix the bug" --agent llm --model qwen2.5-coder \\
         --base-url http://localhost:11434/v1                # local model via Ollama
   ralph --prompt-file ./prompt.md --max-iterations 5
   ralph --status                                            # check loop status
