@@ -3,7 +3,7 @@
  * Ralph Wiggum Loop for AI agents
  *
  * Implementation of the Ralph Wiggum technique - continuous self-referential
- * AI loops for iterative development. Based on ghuntley.com/ralph/
+ * AI loops for iterative development. https://github.com/flywalk4/open-ralph-wiggum
  */
 
 import { $ } from "bun";
@@ -528,7 +528,7 @@ Arguments:
 
 To stop manually: Ctrl+C
 
-Learn more: https://ghuntley.com/ralph/
+Learn more: https://github.com/flywalk4/open-ralph-wiggum
 `);
   process.exit(0);
 }

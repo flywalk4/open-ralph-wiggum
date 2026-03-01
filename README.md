@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Th0rgal/ralph-wiggum/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <a href="https://github.com/Th0rgal/ralph-wiggum"><img src="https://img.shields.io/badge/built%20with-Bun%20%2B%20TypeScript-f472b6.svg" alt="Built with Bun + TypeScript"></a>
-  <a href="https://github.com/Th0rgal/ralph-wiggum/releases"><img src="https://img.shields.io/github/v/release/Th0rgal/ralph-wiggum?include_prereleases" alt="Release"></a>
+  <a href="https://github.com/flywalk4/open-ralph-wiggum/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="https://github.com/flywalk4/open-ralph-wiggum"><img src="https://img.shields.io/badge/built%20with-Bun%20%2B%20TypeScript-f472b6.svg" alt="Built with Bun + TypeScript"></a>
+  <a href="https://github.com/flywalk4/open-ralph-wiggum/releases"><img src="https://img.shields.io/github/v/release/flywalk4/open-ralph-wiggum?include_prereleases" alt="Release"></a>
 </p>
 
 <p align="center">
@@ -95,19 +95,19 @@ done
 ### npm (recommended)
 
 ```bash
-npm install -g @th0rgal/ralph-wiggum
+npm install -g @flywalk4/ralph-wiggum
 ```
 
 ### Bun
 
 ```bash
-bun add -g @th0rgal/ralph-wiggum
+bun add -g @flywalk4/ralph-wiggum
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/Th0rgal/open-ralph-wiggum
+git clone https://github.com/flywalk4/open-ralph-wiggum
 cd open-ralph-wiggum
 ./install.sh        # Linux / macOS
 .\install.ps1       # Windows (PowerShell)
@@ -116,7 +116,7 @@ cd open-ralph-wiggum
 ### Uninstall
 
 ```bash
-npm uninstall -g @th0rgal/ralph-wiggum
+npm uninstall -g @flywalk4/ralph-wiggum
 # or from the repo:
 ./uninstall.sh      # Linux / macOS
 .\uninstall.ps1     # Windows
