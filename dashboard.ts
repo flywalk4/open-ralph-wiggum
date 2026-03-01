@@ -108,6 +108,8 @@ function storePid(serverCwd: string, pid: number, projectCwd: string): void {
     startedAt: new Date().toISOString(),
     projectCwd,
   }));
+  // Also update the globally-active project so all pages switch automatically
+  saveCurrentProject(serverCwd, projectCwd);
 }
 
 function loadPid(cwd: string): number | null {
@@ -126,13 +128,28 @@ function loadProjectCwd(serverCwd: string): string {
   try { return JSON.parse(readFileSync(p, "utf-8")).projectCwd ?? serverCwd; } catch { return serverCwd; }
 }
 
+function currentProjectFile(serverCwd: string): string {
+  return join(stateDir(serverCwd), "current-project.json");
+}
+
+/** Persist a project as the globally-active project for the dashboard. */
+function saveCurrentProject(serverCwd: string, projectCwd: string): void {
+  mkdirSync(stateDir(serverCwd), { recursive: true });
+  writeFileSync(currentProjectFile(serverCwd), JSON.stringify({ cwd: projectCwd }), "utf-8");
+}
+
 /**
- * Resolve which project cwd to display.
- * Prefer an explicit ?cwd= URL param (user switched project manually),
- * then fall back to the last ralph-launched cwd, then serverCwd.
+ * Single source of truth for which project all pages display.
+ * Priority: current-project.json → PID file (last launched) → serverCwd.
  */
-function resolveViewCwd(serverCwd: string, urlCwd: string | null): string {
-  if (urlCwd && urlCwd.trim() && existsSync(urlCwd.trim())) return urlCwd.trim();
+function loadCurrentProject(serverCwd: string): string {
+  const f = currentProjectFile(serverCwd);
+  if (existsSync(f)) {
+    try {
+      const v = JSON.parse(readFileSync(f, "utf-8")).cwd;
+      if (v && existsSync(v)) return v;
+    } catch {}
+  }
   return loadProjectCwd(serverCwd);
 }
 
@@ -1105,19 +1122,15 @@ function htmlPage(
   activePath: string,
   extraHead = "",
   state?: Record<string, unknown> | null,
-  projectCwd?: string          // when set, appends ?cwd= to nav links
+  _unused?: string   // kept for API compat, no longer used
 ): string {
   const isActive = state?.active === true;
   const dotClass = isActive ? "status-dot active" : "status-dot";
   const dotTitle = isActive ? `Active — iteration ${state?.iteration ?? "?"}` : "No active loop";
 
-  const cwdParam = projectCwd ? `?cwd=${encodeURIComponent(projectCwd)}` : "";
   const navItem = (href: string, icon: string, label: string) => {
-    // Don't append cwd to Launch (it has its own cwd field) or Docs/Readme
-    const skipCwd = href === "/launch" || href === "/readme";
-    const fullHref = (!skipCwd && cwdParam) ? href + cwdParam : href;
     const cls = activePath === href ? "nav-item active" : "nav-item";
-    return `<a href="${fullHref}" class="${cls}">
+    return `<a href="${href}" class="${cls}">
       <span class="nav-icon">${icon}</span>
       <span>${label}</span>
     </a>`;
@@ -1550,6 +1563,12 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
 
       async function loadProjectInfo(path) {
         if (!path) return;
+        // Update global current project on the server
+        fetch('/api/set-project', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cwd: path }),
+        }).catch(() => {});
         const card = document.getElementById('project-card');
         card.style.display = 'block';
         card.innerHTML = '<p class="project-card-loading">⏳ Loading project info…</p>';
@@ -1615,7 +1634,7 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
 // ─── Route: Status ────────────────────────────────────────────────────────────
 
 function routeStatus(cwd: string): string {
-  const projectCwd = loadProjectCwd(cwd);
+  const projectCwd = loadCurrentProject(cwd);
   const state = loadState(projectCwd);
   const history = loadHistory(projectCwd);
   const hasPid = existsSync(pidPath(cwd));
@@ -1713,6 +1732,7 @@ function routeStatus(cwd: string): string {
       </script>`
     : "";
 
+  const IS_WIN = process.platform === "win32";
   return htmlPage("Status", `
     <div class="page-header">
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -1721,6 +1741,7 @@ function routeStatus(cwd: string): string {
         <button class="btn btn-ghost btn-sm" onclick="location.reload()">↻ Refresh</button>
       </div>
     </div>
+    ${projectSelectorBar(projectCwd, IS_WIN)}
     ${stateHtml}
     <h2>Recent Iterations</h2>
     ${historyHtml}
@@ -1729,7 +1750,7 @@ function routeStatus(cwd: string): string {
 
 // ─── Route: Plan ─────────────────────────────────────────────────────────────
 
-/** Compact bar shown on Plan/Activity/etc. pages to switch the viewed project. */
+/** Compact bar shown on all project pages to switch the active project globally. */
 function projectSelectorBar(projectCwd: string, isWindows: boolean): string {
   const basename = projectCwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? projectCwd;
   return `
@@ -1739,7 +1760,7 @@ function projectSelectorBar(projectCwd: string, isWindows: boolean): string {
     <span style="font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px"
           title="${escapeHtml(projectCwd)}">${escapeHtml(projectCwd)}</span>
     <button class="btn btn-ghost btn-sm" onclick="switchProject()"
-      title="Switch to a different project directory">📁 Change</button>
+      title="Switch project — affects all pages">📁 Change</button>
   </div>
   <script>
     const _IS_WINDOWS_SEL = ${JSON.stringify(isWindows)};
@@ -1757,17 +1778,23 @@ function projectSelectorBar(projectCwd: string, isWindows: boolean): string {
       } else {
         path = prompt('Enter project directory path:');
       }
-      if (path) {
-        const url = new URL(location.href);
-        url.searchParams.set('cwd', path);
-        location.href = url.toString();
-      }
+      if (path) await setProject(path);
+    }
+    async function setProject(path) {
+      try {
+        await fetch('/api/set-project', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cwd: path }),
+        });
+        location.reload();
+      } catch (e) { alert('Failed to switch project: ' + e.message); }
     }
   </script>`;
 }
 
-function routePlan(cwd: string, urlCwd: string | null): string {
-  const projectCwd = resolveViewCwd(cwd, urlCwd);
+function routePlan(cwd: string): string {
+  const projectCwd = loadCurrentProject(cwd);
   const state = loadState(projectCwd);
   const IS_WIN = process.platform === "win32";
   const selectorBar = projectSelectorBar(projectCwd, IS_WIN);
@@ -1887,8 +1914,8 @@ function buildActivityHtml(projectCwd: string, state: Record<string, unknown> | 
     ${timelineHtml}`;
 }
 
-function routeActivity(cwd: string, urlCwd: string | null): string {
-  const projectCwd = resolveViewCwd(cwd, urlCwd);
+function routeActivity(cwd: string): string {
+  const projectCwd = loadCurrentProject(cwd);
   const state = loadState(projectCwd);
   const isActive = state?.active === true;
 
@@ -1905,12 +1932,10 @@ function routeActivity(cwd: string, urlCwd: string | null): string {
         });
       }
     }
-    const VIEW_CWD = ${JSON.stringify(projectCwd)};
-    const API_URL = '/api/activity-data?cwd=' + encodeURIComponent(VIEW_CWD);
     let lastRev = '';
     setInterval(async () => {
       try {
-        const r = await fetch(API_URL);
+        const r = await fetch('/api/activity-data');
         const d = await r.json();
         const rev = JSON.stringify(d);
         if (rev === lastRev) return;
@@ -1991,7 +2016,7 @@ function routeActivity(cwd: string, urlCwd: string | null): string {
 // ─── Route: Logs ──────────────────────────────────────────────────────────────
 
 function routeLogs(cwd: string): string {
-  const projectCwd = loadProjectCwd(cwd);
+  const projectCwd = loadCurrentProject(cwd);
   const state = loadState(projectCwd);
   const history = loadHistory(projectCwd);
   if (!history || !Array.isArray((history as { iterations?: unknown[] }).iterations)) {
@@ -2061,7 +2086,7 @@ function routeLogs(cwd: string): string {
 // ─── Route: Intervene ─────────────────────────────────────────────────────────
 
 function routeInterveneGet(cwd: string, flash?: { type: string; message: string }): string {
-  const projectCwd = loadProjectCwd(cwd);
+  const projectCwd = loadCurrentProject(cwd);
   const state = loadState(projectCwd);
   const current = loadContext(projectCwd);
   const flashHtml = flash
@@ -2098,7 +2123,7 @@ function routeInterveneGet(cwd: string, flash?: { type: string; message: string 
 }
 
 async function routeIntervenePost(req: Request, cwd: string): Promise<Response> {
-  const projectCwd = loadProjectCwd(cwd);
+  const projectCwd = loadCurrentProject(cwd);
   let body = "";
   try { body = await req.text(); } catch { return new Response("Bad request", { status: 400 }); }
   const context = new URLSearchParams(body).get("context") ?? "";
@@ -2109,7 +2134,7 @@ async function routeIntervenePost(req: Request, cwd: string): Promise<Response> 
 }
 
 function routeInterveneClear(cwd: string): Response {
-  const p = contextPath(loadProjectCwd(cwd));
+  const p = contextPath(loadCurrentProject(cwd));
   if (existsSync(p)) writeFileSync(p, "");
   return new Response(null, { status: 302, headers: { Location: "/intervene?cleared=1" } });
 }
@@ -2117,7 +2142,7 @@ function routeInterveneClear(cwd: string): Response {
 // ─── Route: README ────────────────────────────────────────────────────────────
 
 function routeConsole(cwd: string): string {
-  const projectCwd = loadProjectCwd(cwd);
+  const projectCwd = loadCurrentProject(cwd);
   const state = loadState(projectCwd);
   const isActive = state?.active === true;
   const lp = logPath(projectCwd);
@@ -2160,7 +2185,7 @@ function routeConsole(cwd: string): string {
 }
 
 function routeReadme(cwd: string): string {
-  const state = loadState(loadProjectCwd(cwd));
+  const state = loadState(loadCurrentProject(cwd));
   if (!existsSync(RALPH_README_PATH)) {
     return htmlPage("Docs", `
       <div class="page-header"><h1>📖 Docs</h1></div>
@@ -2297,7 +2322,7 @@ async function routeStop(cwd: string): Promise<Response> {
 // ─── Route: GET /api/status ───────────────────────────────────────────────────
 
 function routeApiStatus(cwd: string): Response {
-  const state = loadState(loadProjectCwd(cwd));
+  const state = loadState(loadCurrentProject(cwd));
   return new Response(JSON.stringify(state ?? { active: false }), {
     headers: { "Content-Type": "application/json" },
   });
@@ -2305,9 +2330,8 @@ function routeApiStatus(cwd: string): Response {
 
 // ─── Route: GET /api/activity-data ───────────────────────────────────────────
 
-function routeApiActivityData(cwd: string, req: Request): Response {
-  const urlCwd = new URL(req.url).searchParams.get("cwd");
-  const projectCwd = resolveViewCwd(cwd, urlCwd);
+function routeApiActivityData(cwd: string): Response {
+  const projectCwd = loadCurrentProject(cwd);
   const state = loadState(projectCwd);
   const actContent = readFileSafe(activityPath(projectCwd));
   const planContent = readFileSafe(planPath(projectCwd));
@@ -2322,9 +2346,25 @@ function routeApiActivityData(cwd: string, req: Request): Response {
 // ─── Route: GET /api/console-log ─────────────────────────────────────────────
 
 function routeApiConsoleLog(cwd: string): Response {
-  const lp = logPath(loadProjectCwd(cwd));
+  const lp = logPath(loadCurrentProject(cwd));
   const content = existsSync(lp) ? lastNLines(readFileSafe(lp), 200) : "";
   return new Response(content, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+}
+
+// ─── Route: POST /api/set-project ────────────────────────────────────────────
+
+async function routeApiSetProject(req: Request, serverCwd: string): Promise<Response> {
+  try {
+    const body = await req.text();
+    const data = JSON.parse(body);
+    const cwd = String(data.cwd ?? "").trim();
+    if (!cwd) return new Response(JSON.stringify({ error: "cwd required" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    if (!existsSync(cwd)) return new Response(JSON.stringify({ error: "Directory not found" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    saveCurrentProject(serverCwd, cwd);
+    return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 400, headers: { "Content-Type": "application/json" } });
+  }
 }
 
 // ─── Route: GET /api/project-info ────────────────────────────────────────────
@@ -2487,13 +2527,14 @@ export async function startDashboard(port: number, openBrowser: boolean, cwd: st
         return html(routeLaunchGet(cwd, flash));
       }
       if (path === "/status")             return html(routeStatus(cwd));
-      if (path === "/plan")               return html(routePlan(cwd, q.get("cwd")));
-      if (path === "/activity")           return html(routeActivity(cwd, q.get("cwd")));
+      if (path === "/plan")               return html(routePlan(cwd));
+      if (path === "/activity")           return html(routeActivity(cwd));
       if (path === "/logs")               return html(routeLogs(cwd));
       if (path === "/readme")             return html(routeReadme(cwd));
       if (path === "/console")            return html(routeConsole(cwd));
       if (path === "/api/console-log")    return routeApiConsoleLog(cwd);
-      if (path === "/api/activity-data")  return routeApiActivityData(cwd, req);
+      if (path === "/api/activity-data")  return routeApiActivityData(cwd);
+      if (path === "/api/set-project" && req.method === "POST") return routeApiSetProject(req, cwd);
       if (path === "/intervene") {
         if (req.method === "POST") return routeIntervenePost(req, cwd);
         let flash: { type: string; message: string } | undefined;
