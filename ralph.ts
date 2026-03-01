@@ -1859,15 +1859,81 @@ This is iteration 1 and no \`IMPLEMENTATION_PLAN.md\` exists yet. Please do the 
  * The agent is asked to self-direct: choose the most valuable thing to improve,
  * create a plan, implement it, then signal completion.
  */
+/**
+ * Summarise what was done in previous improvement cycles so the agent
+ * doesn't repeat the same improvements.
+ * - Plan mode:  reads archived IMPLEMENTATION_PLAN.cycle{N}.md files.
+ * - Non-plan:   falls back to the last 30 lines of activity.md if it exists.
+ */
+function buildCompletedCyclesSummary(currentCycle: number): string {
+  if (currentCycle <= 1) return "";
+
+  const entries: string[] = [];
+
+  for (let c = 1; c < currentCycle; c++) {
+    const archivePath = join(process.cwd(), `IMPLEMENTATION_PLAN.cycle${c}.md`);
+    if (!existsSync(archivePath)) continue;
+    try {
+      const content = readFileSync(archivePath, "utf-8");
+      const headingMatch = content.match(/^#{1,3}\s+(.+)/m);
+      const focus = headingMatch ? headingMatch[1].trim() : `Improvement ${c}`;
+      const doneItems = [...content.matchAll(/[-*]\s+\[x\]\s+(.+)/gi)].map(m => m[1].trim());
+      const totalItems = (content.match(/[-*]\s+\[[x ]\]/gi) ?? []).length;
+
+      let entry = `**Cycle ${c}**: ${focus}`;
+      if (totalItems > 0) entry += ` (${doneItems.length}/${totalItems} tasks completed)`;
+      entries.push(entry);
+      for (const t of doneItems.slice(0, 4)) entries.push(`  - ✓ ${t}`);
+      if (doneItems.length > 4) entries.push(`  - … and ${doneItems.length - 4} more`);
+    } catch { /* skip unreadable archive */ }
+  }
+
+  if (entries.length > 0) {
+    return `
+## Previously Completed Improvement Cycles
+
+Do NOT repeat or re-implement anything from the list below — it is already done:
+
+${entries.join("\n")}
+
+Choose an area that has NOT been addressed yet, or extends previous work in a substantially different direction.
+
+---`;
+  }
+
+  // Non-plan mode fallback: last 30 lines of activity.md
+  const actPath = join(process.cwd(), "activity.md");
+  if (existsSync(actPath)) {
+    try {
+      const recent = readFileSync(actPath, "utf-8").split("\n").slice(-30).join("\n").trim();
+      if (recent) {
+        return `
+## Recent Activity Log
+
+Use this to understand what has already been done and choose a DIFFERENT area:
+
+\`\`\`
+${recent}
+\`\`\`
+
+---`;
+      }
+    } catch { /* ignore */ }
+  }
+
+  return "";
+}
+
 function buildImprovingPrompt(cycle: number, maxCycles: number, planMode = false): string {
   const cycleLabel = maxCycles > 0 ? `Improvement Cycle ${cycle} of ${maxCycles}` : `Improvement Cycle ${cycle}`;
   const planInstruction = planMode
     ? `\n**Before writing any code:** Create a fresh \`IMPLEMENTATION_PLAN.md\` in the project root with a structured checklist for this improvement (tasks with \`[ ]\` checkboxes). Update \`activity.md\` as you progress and tick off tasks as you complete them.\n`
     : "";
+  const completedSummary = buildCompletedCyclesSummary(cycle);
   return `# ${cycleLabel}
 
 You have successfully completed the previous task/cycle. Now enter autonomous improvement mode.
-
+${completedSummary}
 Review the current state of the entire project and choose the SINGLE MOST VALUABLE improvement you can make right now. Think broadly — pick whatever area will have the greatest positive impact:
 
 - **Architecture & Design** — better abstractions, cleaner separation of concerns, remove duplication
