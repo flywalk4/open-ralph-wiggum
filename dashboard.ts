@@ -1621,7 +1621,7 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
               const p = String(d.lastRun.prompt);
               html += '<div class="project-last-prompt">' + esc(p.substring(0, 140)) + (p.length > 140 ? '…' : '') + '</div>'
                 + '<button type="button" class="btn btn-ghost btn-sm" style="margin-top:8px" '
-                + 'onclick="resumeLastRun(' + JSON.stringify(p) + ')">↩ Resume last run</button>';
+                + 'onclick="resumeLastRun(' + esc(JSON.stringify(p)) + ')">↩ Resume last run</button>';
             }
             html += '</div>';
           } else {
