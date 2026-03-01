@@ -347,12 +347,10 @@ async function stopRalph(cwd: string): Promise<boolean> {
     } else {
       process.kill(pid, "SIGTERM");
     }
-    const p = pidPath(cwd);
-    if (existsSync(p)) unlinkSync(p);
-    return true;
-  } catch {
-    return false;
-  }
+  } catch { /* process may already be dead — still clean up the pid file */ }
+  const p = pidPath(cwd);
+  if (existsSync(p)) unlinkSync(p);
+  return true;
 }
 
 // ─── HTML utils ───────────────────────────────────────────────────────────────
@@ -1807,8 +1805,11 @@ function routeStatus(cwd: string): string {
   const projectCwd = loadCurrentProject(cwd);
   const state = loadState(projectCwd);
   const history = loadHistory(projectCwd);
-  const hasPid = existsSync(pidPath(cwd));
   const isActive = state?.active === true;
+  // Clean up stale pid file when loop is no longer active
+  const pidFile = pidPath(cwd);
+  if (!isActive && existsSync(pidFile)) { try { unlinkSync(pidFile); } catch {} }
+  const hasPid = isActive && existsSync(pidFile);
 
   let statusBadge = `<span class="badge badge-gray">No active loop</span>`;
   let stateHtml = `<p class="empty-state">No active Ralph loop found. Use <a href="/launch">Launch</a> to start one.</p>`;
