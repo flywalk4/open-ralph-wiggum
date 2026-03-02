@@ -336,8 +336,17 @@ async function launchRalph(formData: URLSearchParams, serverCwd: string): Promis
 }
 
 async function stopRalph(cwd: string): Promise<boolean> {
-  const pid = loadPid(cwd);
+  const pidFile = pidPath(cwd);
+  if (!existsSync(pidFile)) return false;
+  let pid: number | null = null;
+  let projectCwd = cwd;
+  try {
+    const data = JSON.parse(readFileSync(pidFile, "utf-8"));
+    pid = data.pid ?? null;
+    projectCwd = data.projectCwd ?? cwd;
+  } catch { return false; }
   if (!pid) return false;
+
   try {
     if (process.platform === "win32") {
       Bun.spawn(["taskkill", "/PID", String(pid), "/F", "/T"], {
@@ -348,17 +357,20 @@ async function stopRalph(cwd: string): Promise<boolean> {
       process.kill(pid, "SIGTERM");
     }
   } catch { /* process may already be dead — still clean up */ }
-  const p = pidPath(cwd);
-  if (existsSync(p)) unlinkSync(p);
-  // Mark state as inactive so /api/status reflects the stop immediately.
-  // A forced kill bypasses ralph.ts's own clearState(), leaving active:true.
-  const sp = statePath(cwd);
+
+  if (existsSync(pidFile)) unlinkSync(pidFile);
+
+  // Mark the project's state file as inactive so /api/status reflects the
+  // stop immediately. A forced kill bypasses ralph.ts's clearState(),
+  // leaving active:true in the file. Use projectCwd (not server cwd) because
+  // that's where ralph writes its state.
+  const sp = statePath(projectCwd);
   if (existsSync(sp)) {
     try {
       const s = JSON.parse(readFileSync(sp, "utf-8"));
       s.active = false;
       writeFileSync(sp, JSON.stringify(s, null, 2));
-    } catch { /* ignore parse errors — state will be stale but harmless */ }
+    } catch { /* ignore — state will be stale but harmless */ }
   }
   return true;
 }
