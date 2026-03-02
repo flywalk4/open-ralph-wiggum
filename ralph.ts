@@ -2339,28 +2339,39 @@ async function streamProcessOutput(
     }
   };
 
+  // Track readers so we can cancel them when the process exits but streams
+  // don't send EOF naturally (can happen with certain agents / Windows shells).
+  let stdoutReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let stderrReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
   const streamText = async (
     stream: ReadableStream<Uint8Array> | null,
     onText: (chunk: string) => void,
     isError: boolean,
+    readerSlot: (r: ReadableStreamDefaultReader<Uint8Array>) => void,
   ) => {
     if (!stream) return;
     const reader = stream.getReader();
+    readerSlot(reader);
     const decoder = new TextDecoder();
     let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      const text = decoder.decode(value, { stream: true });
-      if (text.length > 0) {
-        onText(text);
-        buffer += text;
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          handleLine(line, isError);
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        if (text.length > 0) {
+          onText(text);
+          buffer += text;
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            handleLine(line, isError);
+          }
         }
       }
+    } catch {
+      // reader.cancel() was called (process exited without closing streams) — expected
     }
     const flushed = decoder.decode();
     if (flushed.length > 0) {
@@ -2371,6 +2382,15 @@ async function streamProcessOutput(
       handleLine(buffer, isError);
     }
   };
+
+  // If the process exits but stdout/stderr don't close naturally (e.g. on
+  // Windows with certain shells), cancel the readers after a short grace period
+  // so clearInterval(heartbeatTimer) runs and the heartbeat stops printing.
+  void proc.exited.then(async () => {
+    await new Promise<void>(r => setTimeout(r, 1000));
+    stdoutReader?.cancel().catch(() => {});
+    stderrReader?.cancel().catch(() => {});
+  });
 
   const heartbeatTimer = setInterval(() => {
     const now = Date.now();
@@ -2390,6 +2410,7 @@ async function streamProcessOutput(
           stdoutText += chunk;
         },
         false,
+        r => { stdoutReader = r; },
       ),
       streamText(
         proc.stderr,
@@ -2397,6 +2418,7 @@ async function streamProcessOutput(
           stderrText += chunk;
         },
         true,
+        r => { stderrReader = r; },
       ),
     ]);
   } finally {
