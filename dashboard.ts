@@ -2963,34 +2963,117 @@ function stripAnsiCodes(str: string): string {
   return str.replace(/\x1b\[[0-9;]*[mGKHFABCDEF]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
 }
 
-/** Resolve the opencode binary name (handles Windows .cmd wrapper). */
-function resolveOpencodeBinary(): string {
-  const override = process.env.RALPH_OPENCODE_BINARY;
+/** Resolve a CLI binary name, handling Windows .cmd wrappers. */
+function resolveAgentBinary(base: string, envVar: string): string {
+  const override = process.env[envVar];
   if (override) return override;
-  if (process.platform === "win32") {
-    if (!Bun.which("opencode") && Bun.which("opencode.cmd")) return "opencode.cmd";
+  if (process.platform === "win32" && !Bun.which(base) && Bun.which(`${base}.cmd`)) return `${base}.cmd`;
+  return base;
+}
+
+/** Extract model text from raw agent output, stripping terminal UI chrome. */
+function extractAgentText(raw: string, agentType: string): string {
+  const clean = stripAnsiCodes(raw);
+  const lines = clean.split("\n");
+  const kept: string[] = [];
+
+  for (const line of lines) {
+    const t = line.trimEnd();
+    // Universal: box-drawing / spinners
+    if (/^\s*[|│]/.test(t)) continue;
+    if (/[┌┐└┘├┤┬┴─╭╮╰╯]/.test(t)) continue;
+    if (/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s/.test(t)) continue;
+    if (/^\s*(Tool|Running|Thinking|Calling|Reading|Writing|Searching|Fetching)\b/i.test(t)) continue;
+
+    // claude-code: strip JSON stream lines and cost summary
+    if (agentType === "claude-code") {
+      if (/^\s*\{/.test(t) && /\"type\"/.test(t)) continue;     // JSON event lines
+      if (/Cost:|tokens|API Usage/i.test(t)) continue;
+    }
+    // aider: strip its own UI decorations
+    if (agentType === "aider") {
+      if (/^(Aider|Added|Applied edit|Commit|Wrote|Created|Updated|Warning:|Info:)\b/i.test(t)) continue;
+      if (/^─{3,}/.test(t)) continue;
+    }
+    // codex: strip status lines
+    if (agentType === "codex") {
+      if (/^(▶|✔|✘|→)\s/.test(t)) continue;
+    }
+    // llm: strip [file] markers
+    if (agentType === "llm") {
+      if (/^\[file\]\s/.test(t)) continue;
+    }
+
+    kept.push(t);
   }
-  return "opencode";
+
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /**
- * Run opencode CLI for a single-turn enrichment.
- * We prepend instructions to NOT use any file tools so opencode stays pure-text.
+ * Spawn any supported agent CLI for a single enrichment call.
+ * The combined system+user prompt is passed directly so the agent outputs only text.
  */
-async function callOpencodeCliEnrich(systemPrompt: string, userPrompt: string, model: string, projectCwd: string): Promise<string> {
-  const binary = resolveOpencodeBinary();
+async function callAgentCliEnrich(
+  agentType: string,
+  systemPrompt: string,
+  userPrompt: string,
+  model: string,
+  baseUrl: string,
+  projectCwd: string,
+): Promise<string> {
+  const toolRestriction = `\n\n⚠️ TOOL USE RESTRICTION: This is a text-only task. Do NOT write or read files, run commands, or make any codebase changes. Output ONLY the enriched task specification text.\n\nTASK TO ENRICH:\n${userPrompt}`;
+  const fullPrompt = `${systemPrompt}${toolRestriction}`;
 
-  // Combine into one prompt. Lead with a hard instruction to avoid file tools.
-  const fullPrompt = `${systemPrompt}
+  let binary: string;
+  let args: string[];
 
-⚠️ TOOL USE RESTRICTION: This is a text-only task. You MUST NOT use any file tools, write or read any files, execute commands, or make any changes to the codebase. Output ONLY the enriched task specification text — nothing else.
+  switch (agentType) {
+    case "opencode":
+      binary = resolveAgentBinary("opencode", "RALPH_OPENCODE_BINARY");
+      args = ["run"];
+      if (model) args.push("-m", model);
+      args.push(fullPrompt);
+      break;
 
-TASK TO ENRICH:
-${userPrompt}`;
+    case "claude-code":
+      binary = resolveAgentBinary("claude", "RALPH_CLAUDE_BINARY");
+      args = ["-p", fullPrompt];
+      if (model) args.push("--model", model);
+      break;
 
-  const args = ["run"];
-  if (model) args.push("-m", model);
-  args.push(fullPrompt);
+    case "codex":
+      binary = resolveAgentBinary("codex", "RALPH_CODEX_BINARY");
+      args = ["exec"];
+      if (model) args.push("--model", model);
+      args.push(fullPrompt);
+      break;
+
+    case "copilot":
+      binary = resolveAgentBinary("copilot", "RALPH_COPILOT_BINARY");
+      args = ["-p", fullPrompt];
+      if (model) args.push("--model", model);
+      break;
+
+    case "aider":
+      binary = resolveAgentBinary("aider", "RALPH_AIDER_BINARY");
+      args = ["--message", fullPrompt, "--no-auto-commits", "--no-check-update", "--no-show-model-warnings"];
+      if (model) args.push("--model", model);
+      if (baseUrl) args.push("--openai-api-base", baseUrl);
+      break;
+
+    case "llm": {
+      binary = "bun";
+      const scriptPath = join(import.meta.dir, ".ralph", "llm-agent.ts");
+      args = [scriptPath, "--message", fullPrompt];
+      if (model) args.push("--model", model);
+      if (baseUrl) args.push("--base-url", baseUrl);
+      break;
+    }
+
+    default:
+      throw new Error(`Unknown agent type: ${agentType}`);
+  }
 
   const proc = Bun.spawn([binary, ...args], {
     cwd: projectCwd,
@@ -3001,36 +3084,26 @@ ${userPrompt}`;
   });
   proc.stdin.end();
 
-  // Collect stdout with 120s timeout
   const decoder = new TextDecoder();
   const chunks: string[] = [];
   const reader = proc.stdout.getReader();
   const cancel = new Promise<void>(r => setTimeout(r, 120_000));
   await Promise.race([
     (async () => {
-      try { while (true) { const { value, done } = await reader.read(); if (done) break; if (value) chunks.push(decoder.decode(value, { stream: true })); } } catch {}
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) chunks.push(decoder.decode(value, { stream: true }));
+        }
+      } catch {}
     })(),
     cancel,
   ]);
   reader.cancel().catch(() => {});
   await proc.exited;
 
-  const raw = stripAnsiCodes(chunks.join(""));
-
-  // Extract model text — filter out opencode's UI chrome (tool call boxes, spinners, etc.)
-  const lines = raw.split("\n");
-  const kept: string[] = [];
-  for (const line of lines) {
-    const t = line.trimEnd();
-    if (/^\s*[|│]/.test(t)) continue;                            // tool call boxes
-    if (/[┌┐└┘├┤┬┴─╭╮╰╯]/.test(t)) continue;                   // box-drawing chars
-    if (/^[\s✓✗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●○◆▲▼]\s/.test(t)) continue;         // spinners / bullets
-    if (/^\s*(Tool|Running|Thinking|Calling|Reading|Writing|Searching)\b/i.test(t)) continue;
-    if (/^\s*>\s/.test(t) && t.length < 80) continue;            // short quoted lines (UI)
-    kept.push(t);
-  }
-
-  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return extractAgentText(chunks.join(""), agentType);
 }
 
 /** Path to opencode's user config — same logic as ralph.ts OPENCODE_USER_CONFIG_PATH. */
@@ -3201,35 +3274,28 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
 
   // ── Resolve which backend to use ─────────────────────────────────────────
   // Priority:
-  //   1. base-url in form                              → OpenAI-compatible
-  //   2. agent=opencode (default), no base-url         → opencode CLI (uses free models)
-  //   3. agent=claude-code or model starts with claude → Anthropic API key
-  //   4. ANTHROPIC_API_KEY available                   → Anthropic API
-  //   5. OPENAI_API_KEY available                      → OpenAI API
-  //   6. error
+  //   1. Known agent CLI (opencode/claude-code/codex/copilot/aider/llm) → spawn directly
+  //   2. base-url in form (explicit override)                            → OpenAI-compatible API
+  //   3. ANTHROPIC_API_KEY / OPENAI_API_KEY env                         → cloud API fallback
 
   const effectiveAgent = agent || "opencode";
+  const CLI_AGENTS = ["opencode", "claude-code", "codex", "copilot", "aider", "llm"];
 
-  // ── Path 1: explicit base-url in form ──────────────────────────────────
-  if (baseUrl) {
-    // handled below in the try block
-  }
-  // ── Path 2: opencode CLI (free models, no API key required) ────────────
-  else if (effectiveAgent === "opencode") {
+  // ── Path 1: use selected agent CLI directly ────────────────────────────
+  if (CLI_AGENTS.includes(effectiveAgent)) {
     const projectCwd = loadCurrentProject(serverCwd);
     const context = buildEnrichmentContext(projectCwd);
     const systemPrompt2 = buildEnrichSystemPrompt(context);
     try {
-      const enriched = await callOpencodeCliEnrich(systemPrompt2, rawPrompt, modelRaw, projectCwd);
+      const enriched = await callAgentCliEnrich(effectiveAgent, systemPrompt2, rawPrompt, modelRaw, baseUrl, projectCwd);
       if (enriched && enriched.length > 80) {
         return new Response(JSON.stringify({ prompt: enriched }), { headers: { "Content-Type": "application/json" } });
       }
       // Too short — fall through to API-based methods
     } catch (cliErr: any) {
       const msg = String(cliErr?.message ?? cliErr);
-      // If binary not found, give a clear message
       if (msg.includes("not found") || msg.includes("ENOENT") || msg.includes("No such file")) {
-        return new Response(JSON.stringify({ error: "opencode CLI not found. Install it or set RALPH_OPENCODE_BINARY, or provide a Base URL / API key." }), {
+        return new Response(JSON.stringify({ error: `${effectiveAgent} CLI not found. Install it or provide a Base URL / API key.` }), {
           status: 400, headers: { "Content-Type": "application/json" },
         });
       }
