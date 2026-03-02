@@ -347,9 +347,19 @@ async function stopRalph(cwd: string): Promise<boolean> {
     } else {
       process.kill(pid, "SIGTERM");
     }
-  } catch { /* process may already be dead — still clean up the pid file */ }
+  } catch { /* process may already be dead — still clean up */ }
   const p = pidPath(cwd);
   if (existsSync(p)) unlinkSync(p);
+  // Mark state as inactive so /api/status reflects the stop immediately.
+  // A forced kill bypasses ralph.ts's own clearState(), leaving active:true.
+  const sp = statePath(cwd);
+  if (existsSync(sp)) {
+    try {
+      const s = JSON.parse(readFileSync(sp, "utf-8"));
+      s.active = false;
+      writeFileSync(sp, JSON.stringify(s, null, 2));
+    } catch { /* ignore parse errors — state will be stale but harmless */ }
+  }
   return true;
 }
 
