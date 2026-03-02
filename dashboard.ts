@@ -724,13 +724,13 @@ const GLOBAL_CSS = `
     flex-direction: column;
     align-items: center;
     min-height: 100vh;
-    padding: 0 16px 60px;
+    padding: 0 24px 60px;
     transition: margin-left 0.22s ease;
   }
 
   .main-inner {
-    width: 100%;
-    max-width: 800px;
+    width: 90%;
+    max-width: 1400px;
     padding: 40px 0 0;
   }
 
@@ -1694,7 +1694,7 @@ function htmlPage(
     } catch {}
   }
   loadSidebarProject();
-  async function sidebarSwitchProject() {
+  window.sidebarSwitchProject = async function() {
     let path = null;
     if (_IS_WIN_SIDEBAR) {
       const btn = document.getElementById('sidebar-project-btn');
@@ -1711,7 +1711,7 @@ function htmlPage(
         location.reload();
       } catch (e) { alert('Failed: ' + e.message); }
     }
-  }
+  };
   setInterval(async function() {
     try {
       const s = await (await fetch('/api/status')).json();
