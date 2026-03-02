@@ -551,6 +551,7 @@ const GLOBAL_CSS = `
     --radius:      12px;
     --radius-sm:   8px;
     --sidebar-w:   260px;
+    --sidebar-w-collapsed: 56px;
     --font-mono:   'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   }
 
@@ -579,8 +580,10 @@ const GLOBAL_CSS = `
     display: flex;
     flex-direction: column;
     z-index: 100;
+    overflow-x: hidden;
     overflow-y: auto;
     padding: 8px;
+    transition: width 0.22s ease;
   }
 
   .sidebar-brand {
@@ -722,6 +725,7 @@ const GLOBAL_CSS = `
     align-items: center;
     min-height: 100vh;
     padding: 0 16px 60px;
+    transition: margin-left 0.22s ease;
   }
 
   .main-inner {
@@ -729,6 +733,43 @@ const GLOBAL_CSS = `
     max-width: 800px;
     padding: 40px 0 0;
   }
+
+  /* ── Sidebar collapse ───────────────────────────────────────── */
+  .sidebar-brand-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .sidebar-toggle {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; line-height: 1;
+    transition: background 0.15s, color 0.15s, transform 0.25s ease;
+    flex-shrink: 0;
+  }
+  .sidebar-toggle:hover { background: var(--surface-2); color: var(--text); }
+
+  /* Collapsed state overrides */
+  body.sidebar-collapsed { --sidebar-w: var(--sidebar-w-collapsed); }
+  body.sidebar-collapsed .sidebar-brand-left { display: none !important; }
+  body.sidebar-collapsed .brand-new-btn { display: none !important; }
+  body.sidebar-collapsed .sidebar-brand { justify-content: center; }
+  body.sidebar-collapsed .sidebar-brand-right { width: 100%; justify-content: center; }
+  body.sidebar-collapsed .sidebar-section-label { display: none !important; }
+  body.sidebar-collapsed .nav-item > span:last-child { display: none !important; }
+  body.sidebar-collapsed .nav-item { justify-content: center; padding: 8px 6px; }
+  body.sidebar-collapsed .nav-icon { width: auto; }
+  body.sidebar-collapsed #status-label { display: none !important; }
+  body.sidebar-collapsed .sidebar-status-row { justify-content: center; padding: 8px 6px; }
+  body.sidebar-collapsed .sidebar-stop-wrap { display: none !important; }
+  body.sidebar-collapsed .sidebar-toggle { transform: scaleX(-1); }
 
   /* ── Typography ──────────────────────────────────────────────── */
   h1 { font-size: 20px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
@@ -1370,7 +1411,7 @@ function htmlPage(
 
   const navItem = (href: string, icon: string, label: string) => {
     const cls = activePath === href ? "nav-item active" : "nav-item";
-    return `<a href="${href}" class="${cls}">
+    return `<a href="${href}" class="${cls}" title="${label}">
       <span class="nav-icon">${icon}</span>
       <span>${label}</span>
     </a>`;
@@ -1394,7 +1435,10 @@ function htmlPage(
         <img src="/logo.png" alt="Ralph" class="brand-logo">
         <span>Ralph Wiggum</span>
       </div>
-      <a href="/launch" class="brand-new-btn" title="New launch">✎</a>
+      <div class="sidebar-brand-right">
+        <a href="/launch" class="brand-new-btn" title="New launch">✎</a>
+        <button class="sidebar-toggle" id="sidebar-toggle" title="Свернуть меню">‹</button>
+      </div>
     </div>
 
     <nav class="sidebar-nav">
@@ -1433,6 +1477,7 @@ function htmlPage(
 </div>
 <script>
 (function() {
+  // ── Status polling ──────────────────────────────────────────
   setInterval(async function() {
     try {
       const s = await (await fetch('/api/status')).json();
@@ -1446,6 +1491,19 @@ function htmlPage(
       if (wrap) wrap.style.display = s.active ? 'block' : 'none';
     } catch {}
   }, 5000);
+
+  // ── Sidebar collapse ────────────────────────────────────────
+  const COLLAPSED_KEY = 'ralph-sidebar-collapsed';
+  if (localStorage.getItem(COLLAPSED_KEY) === '1') {
+    document.body.classList.add('sidebar-collapsed');
+  }
+  const btn = document.getElementById('sidebar-toggle');
+  if (btn) {
+    btn.addEventListener('click', function() {
+      const collapsed = document.body.classList.toggle('sidebar-collapsed');
+      localStorage.setItem(COLLAPSED_KEY, collapsed ? '1' : '0');
+    });
+  }
 })();
 </script>
 </body>
