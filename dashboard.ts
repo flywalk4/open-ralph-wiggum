@@ -770,22 +770,87 @@ const GLOBAL_CSS = `
   body.sidebar-collapsed .sidebar-status-row { justify-content: center; padding: 8px 6px; }
   body.sidebar-collapsed .sidebar-stop-wrap { display: none !important; }
   body.sidebar-collapsed .sidebar-toggle { transform: scaleX(-1); }
+  body.sidebar-collapsed .sidebar-project-name { display: none !important; }
+  body.sidebar-collapsed .sidebar-project-btn { justify-content: center; }
 
-  /* ── Launch page ─────────────────────────────────────────────── */
+  /* ── Sidebar project switcher ──────────────────────────────────── */
+  .sidebar-project { padding: 2px 0 4px; }
+  .sidebar-project-btn {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px; border-radius: var(--radius-sm);
+    background: transparent; border: none; color: var(--text-muted);
+    cursor: pointer; width: 100%; font-size: 12px; font-family: inherit;
+    transition: background 0.12s, color 0.12s; text-align: left;
+  }
+  .sidebar-project-btn:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+  .sidebar-project-btn:disabled { opacity: 0.5; cursor: wait; }
+  .sidebar-project-icon { flex-shrink: 0; font-size: 14px; }
+  .sidebar-project-name {
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--font-mono); font-size: 11px;
+  }
+
+    /* ── Launch page ─────────────────────────────────────────────── */
   .launch-wrap {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: 176px 1fr 176px;
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas: "header header header" "modes center options" "submit submit submit";
+    gap: 8px;
     height: calc(100vh - 80px);
-    gap: 0;
   }
   .launch-header {
+    grid-area: header;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 0 0 12px;
+    gap: 10px;
+    padding: 0 0 4px;
+    flex-wrap: wrap;
+  }
+  .launch-title { font-size: 18px; font-weight: 600; color: var(--text); margin-right: auto; }
+  .launch-center {
+    grid-area: center;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .launch-panel {
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 10px 6px;
+    overflow-y: auto;
+    min-height: 0;
+  }
+  .launch-panel-left  { grid-area: modes; }
+  .launch-panel-right { grid-area: options; }
+  .launch-panel-title {
+    font-size: 10px; font-weight: 700; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.07em;
+    padding-bottom: 8px; margin-bottom: 2px;
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .launch-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
     flex-shrink: 0;
   }
-  .launch-title { font-size: 18px; font-weight: 600; color: var(--text); }
+  .launch-section-title {
+    font-size: 10px; font-weight: 700; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 7px;
+  }
+  .launch-section .acc-form-row { gap: 6px; }
+  .launch-section .acc-form-row + .acc-form-row { margin-top: 5px; }
+  /* Compact toggles in side panels */
+  .launch-panel .toggle-row { padding: 6px 0; }
+  .launch-panel .toggle-name { font-size: 12px; }
+  .launch-panel .toggle-desc { font-size: 10px; }
   .launch-prompt-wrap {
     flex: 1;
     min-height: 0;
@@ -895,7 +960,7 @@ const GLOBAL_CSS = `
   .acc-form-row .fg .input-row input { flex: 1; }
 
   /* Launch submit row */
-  .launch-submit { display: flex; gap: 8px; align-items: center; flex-shrink: 0; padding-bottom: 2px; }
+  .launch-submit { grid-area: submit; display: flex; gap: 8px; align-items: center; padding-bottom: 2px; }
   .launch-submit .btn-primary { flex: 1; padding: 10px; font-size: 14px; font-weight: 600; justify-content: center; }
 
   /* ── Typography ──────────────────────────────────────────────── */
@@ -1534,7 +1599,7 @@ function htmlPage(
   activePath: string,
   extraHead = "",
   state?: Record<string, unknown> | null,
-  _unused?: string   // kept for API compat, no longer used
+  serverCwd = ""     // server working directory, used for sidebar project display
 ): string {
   const isActive = state?.active === true;
   const dotClass = isActive ? "status-dot active" : "status-dot";
@@ -1588,6 +1653,14 @@ function htmlPage(
     </nav>
 
     <div class="sidebar-footer">
+      <div class="sidebar-project" id="sidebar-project">
+        <button type="button" class="sidebar-project-btn" id="sidebar-project-btn"
+          onclick="sidebarSwitchProject()" title="Switch project directory">
+          <span class="sidebar-project-icon">📁</span>
+          <span class="sidebar-project-name" id="sidebar-project-name">Loading…</span>
+        </button>
+      </div>
+      <hr class="sidebar-sep">
       <div class="sidebar-status-row" id="sidebar-status-row" title="${dotTitle}">
         <span class="${dotClass}" id="status-dot"></span>
         <span id="status-label">${isActive ? `Running${iterLabel}` : "Idle"}</span>
@@ -1610,6 +1683,35 @@ function htmlPage(
 <script>
 (function() {
   // ── Status polling ──────────────────────────────────────────
+  const _IS_WIN_SIDEBAR = ${JSON.stringify(process.platform === "win32")};
+  async function loadSidebarProject() {
+    try {
+      const d = await (await fetch('/api/project-name')).json();
+      const el = document.getElementById('sidebar-project-name');
+      if (el) el.textContent = d.name ?? d.cwd ?? '…';
+      const btn = document.getElementById('sidebar-project-btn');
+      if (btn) btn.title = d.cwd ?? '';
+    } catch {}
+  }
+  loadSidebarProject();
+  async function sidebarSwitchProject() {
+    let path = null;
+    if (_IS_WIN_SIDEBAR) {
+      const btn = document.getElementById('sidebar-project-btn');
+      if (btn) btn.disabled = true;
+      try { const d = await (await fetch('/api/browse-native')).json(); path = d.path ?? null; } catch {}
+      if (btn) btn.disabled = false;
+    } else {
+      path = prompt('Enter project directory path:');
+    }
+    if (path) {
+      try {
+        await fetch('/api/set-project', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: path }) });
+        loadSidebarProject();
+        location.reload();
+      } catch (e) { alert('Failed: ' + e.message); }
+    }
+  }
   setInterval(async function() {
     try {
       const s = await (await fetch('/api/status')).json();
@@ -1618,7 +1720,7 @@ function htmlPage(
       const row = document.getElementById('sidebar-status-row');
       if (dot) dot.className = s.active ? 'status-dot active' : 'status-dot';
       if (label) label.textContent = s.active ? 'Running · iter ' + (s.iteration ?? '?') : 'Idle';
-      if (row) row.title = s.active ? 'Running \u2014 iteration ' + (s.iteration ?? '?') : 'No active loop';
+      if (row) row.title = s.active ? 'Running — iteration ' + (s.iteration ?? '?') : 'No active loop';
       const wrap = document.getElementById('sidebar-stop-wrap');
       if (wrap) wrap.style.display = s.active ? 'block' : 'none';
     } catch {}
@@ -1688,192 +1790,121 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
       <!-- Header -->
       <div class="launch-header">
         <div class="launch-title">⚡ Launch Ralph</div>
+        ${flashHtml}${agentWarning}
       </div>
-      ${flashHtml}${agentWarning}
 
-      <!-- Prompt -->
-      <div class="launch-prompt-wrap">
-        <textarea name="prompt" id="prompt"
-          placeholder="Describe the task for Ralph to complete…" spellcheck="false"></textarea>
-        <div class="launch-prompt-footer">
-          <span id="prompt-optional" style="display:none;font-size:11px;color:var(--text-muted)">(optional with --improving)</span>
-          <span id="enrich-status" style="display:none;font-size:11px"></span>
-          <button type="button" id="enrich-btn" class="btn btn-ghost btn-sm"
-            onclick="enrichPrompt()" title="Enrich prompt using the selected model">✨ Enrich</button>
+      <!-- Left: Modes -->
+      <div class="launch-panel launch-panel-left">
+        <div class="launch-panel-title">Modes</div>
+        ${tog("plan", "--plan", "Maintain IMPLEMENTATION_PLAN.md", "void 0")}
+        ${tog("tasks", "--tasks", "Work through ralph-tasks.md", "void 0")}
+        ${tog("improving", "--improving", "Keep improving after completion", "updateImprovingCycles()", "improving-cb")}
+        <div id="improving-cycles-row" style="display:none;padding:4px 0 6px">
+          <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:3px;font-weight:700;text-transform:uppercase;letter-spacing:.06em">Cycles</label>
+          <input type="number" name="improving-cycles" id="improving-cycles"
+            min="1" placeholder="unlimited"
+            style="width:100%;padding:5px 8px;font-size:12px;background:var(--bg);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:var(--text);outline:none">
         </div>
+        ${tog("optimize", "--optimize", "Minimal prompt for weak models", "void 0", "optimize-cb")}
+        ${tog("diff", "--diff", "Inject git diff each iteration", "void 0")}
       </div>
 
-      <!-- Accordions -->
-      <div class="acc-list">
+      <!-- Center -->
+      <div class="launch-center">
+
+        <!-- Prompt -->
+        <div class="launch-prompt-wrap">
+          <textarea name="prompt" id="prompt"
+            placeholder="Describe the task for Ralph to complete..." spellcheck="false"></textarea>
+          <div class="launch-prompt-footer">
+            <span id="prompt-optional" style="display:none;font-size:11px;color:var(--text-muted)">(optional with --improving)</span>
+            <span id="enrich-status" style="display:none;font-size:11px"></span>
+            <button type="button" id="enrich-btn" class="btn btn-ghost btn-sm"
+              onclick="enrichPrompt()" title="Enrich prompt using the selected model">✨ Enrich</button>
+          </div>
+        </div>
 
         <!-- Agent & Model -->
-        <div class="acc-item" id="acc-agent">
-          <div class="acc-header" onclick="accToggle('acc-agent')">
-            <div class="acc-header-left">
-              <span>🤖 Agent &amp; Model</span>
-              <div class="acc-summary" id="summary-agent"></div>
+        <div class="launch-section">
+          <div class="launch-section-title">🤖 Agent &amp; Model</div>
+          <div class="acc-form-row">
+            <div class="fg">
+              <label>Agent</label>
+              <select name="agent" id="agent" onchange="updateOptimize()">
+                <option value="">Default (opencode)</option>
+                <option value="opencode">opencode</option>
+                <option value="claude-code">claude-code</option>
+                <option value="codex">codex</option>
+                <option value="copilot">copilot</option>
+                <option value="aider">aider</option>
+                <option value="llm">llm (built-in)</option>
+              </select>
             </div>
-            <span class="acc-chevron">▼</span>
+            <div class="fg">
+              <label>Model</label>
+              <input type="text" name="model" id="model"
+                placeholder="e.g. claude-sonnet-4-6" list="model-suggestions" autocomplete="off">
+              <datalist id="model-suggestions"></datalist>
+            </div>
+            <div class="fg">
+              <label>Base URL <span style="opacity:.6">(OpenAI-compat.)</span></label>
+              <div class="input-row">
+                <input type="text" name="base-url" id="base-url" placeholder="http://localhost:11434/v1">
+                <button type="button" class="btn btn-ghost btn-sm" id="fetch-models-btn"
+                  onclick="fetchModels()" title="Fetch models">↓</button>
+              </div>
+            </div>
+            <div class="fg">
+              <label>Rotation</label>
+              <input type="text" name="rotation" id="rotation"
+                placeholder="opencode:sonnet,claude-code:gpt-4o">
+            </div>
           </div>
-          <div class="acc-body"><div class="acc-body-inner">
-            <div class="acc-form-row">
-              <div class="fg">
-                <label>Agent</label>
-                <select name="agent" id="agent" onchange="updateAllSummaries();updateOptimize()">
-                  <option value="">Default (opencode)</option>
-                  <option value="opencode">opencode</option>
-                  <option value="claude-code">claude-code</option>
-                  <option value="codex">codex</option>
-                  <option value="copilot">copilot</option>
-                  <option value="aider">aider</option>
-                  <option value="llm">llm (built-in)</option>
-                </select>
-              </div>
-              <div class="fg">
-                <label>Model</label>
-                <input type="text" name="model" id="model"
-                  placeholder="e.g. claude-sonnet-4-6" list="model-suggestions" autocomplete="off"
-                  oninput="updateAllSummaries()">
-                <datalist id="model-suggestions"></datalist>
-              </div>
-            </div>
-            <div class="acc-form-row">
-              <div class="fg">
-                <label>Base URL <span style="opacity:.6">(OpenAI-compatible)</span></label>
-                <div class="input-row">
-                  <input type="text" name="base-url" id="base-url" placeholder="http://localhost:11434/v1">
-                  <button type="button" class="btn btn-ghost btn-sm" id="fetch-models-btn"
-                    onclick="fetchModels()">↓ Models</button>
-                </div>
-              </div>
-              <div class="fg">
-                <label>Rotation <span style="opacity:.6">(cycle per iteration)</span></label>
-                <input type="text" name="rotation" id="rotation"
-                  placeholder="opencode:claude-sonnet-4,claude-code:gpt-4o">
-              </div>
-            </div>
-          </div></div>
         </div>
 
         <!-- Iteration Control -->
-        <div class="acc-item" id="acc-iter">
-          <div class="acc-header" onclick="accToggle('acc-iter')">
-            <div class="acc-header-left">
-              <span>🔁 Iteration Control</span>
-              <div class="acc-summary" id="summary-iter"></div>
+        <div class="launch-section">
+          <div class="launch-section-title">🔁 Iteration</div>
+          <div class="acc-form-row">
+            <div class="fg">
+              <label>Max iter</label>
+              <input type="number" name="max-iterations" id="max-iterations" min="1" placeholder="unlimited">
             </div>
-            <span class="acc-chevron">▼</span>
+            <div class="fg">
+              <label>Min iter</label>
+              <input type="number" name="min-iterations" id="min-iterations" min="1" placeholder="1">
+            </div>
+            <div class="fg">
+              <label>Max tokens</label>
+              <input type="number" name="max-prompt-tokens" id="max-prompt-tokens" min="100" placeholder="unlimited">
+            </div>
+            <div class="fg">
+              <label>Completion</label>
+              <input type="text" name="completion-promise" id="completion-promise" placeholder="COMPLETE">
+            </div>
+            <div class="fg">
+              <label>Abort</label>
+              <input type="text" name="abort-promise" id="abort-promise" placeholder="GIVE_UP">
+            </div>
+            <div class="fg">
+              <label>Preset</label>
+              <input type="text" name="preset" id="preset" placeholder=".ralph/presets.json">
+            </div>
           </div>
-          <div class="acc-body"><div class="acc-body-inner">
-            <div class="acc-form-row">
-              <div class="fg">
-                <label>Max iterations</label>
-                <input type="number" name="max-iterations" id="max-iterations" min="1" placeholder="unlimited"
-                  oninput="updateAllSummaries()">
-              </div>
-              <div class="fg">
-                <label>Min iterations</label>
-                <input type="number" name="min-iterations" id="min-iterations" min="1" placeholder="1"
-                  oninput="updateAllSummaries()">
-              </div>
-              <div class="fg">
-                <label>Max prompt tokens</label>
-                <input type="number" name="max-prompt-tokens" id="max-prompt-tokens" min="100" placeholder="unlimited"
-                  oninput="updateAllSummaries()">
-              </div>
-            </div>
-            <div class="acc-form-row">
-              <div class="fg">
-                <label>Completion signal</label>
-                <input type="text" name="completion-promise" id="completion-promise" placeholder="COMPLETE"
-                  oninput="updateAllSummaries()">
-              </div>
-              <div class="fg">
-                <label>Abort signal</label>
-                <input type="text" name="abort-promise" id="abort-promise" placeholder="GIVE_UP (optional)"
-                  oninput="updateAllSummaries()">
-              </div>
-            </div>
-          </div></div>
         </div>
 
-        <!-- Modes -->
-        <div class="acc-item" id="acc-modes">
-          <div class="acc-header" onclick="accToggle('acc-modes')">
-            <div class="acc-header-left">
-              <span>🎛 Modes</span>
-              <div class="acc-summary" id="summary-modes"></div>
-            </div>
-            <span class="acc-chevron">▼</span>
-          </div>
-          <div class="acc-body"><div class="acc-body-inner">
-            ${tog('plan', '--plan', 'Maintain IMPLEMENTATION_PLAN.md', 'updateAllSummaries()')}
-            ${tog('tasks', '--tasks', 'Work through ralph-tasks.md checklist', 'updateAllSummaries()')}
-            ${tog('improving', '--improving', 'Keep running after completion, autonomously improve', 'updateAllSummaries();updateImprovingCycles()', 'improving-cb')}
-            <div id="improving-cycles-row" style="display:none;padding:6px 0 2px">
-              <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;font-weight:500">Improvement cycles</label>
-              <input type="number" name="improving-cycles" id="improving-cycles"
-                min="1" placeholder="unlimited"
-                style="width:140px;padding:6px 10px;font-size:13px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);outline:none">
-            </div>
-            <div id="optimize-label">
-              ${tog('optimize', '--optimize', 'Minimal prompt for small/weak models', 'updateAllSummaries()', 'optimize-cb')}
-            </div>
-            ${tog('diff', '--diff', 'Inject git diff into each iteration', 'updateAllSummaries()')}
-          </div></div>
-        </div>
+      </div><!-- /.launch-center -->
 
-        <!-- Options -->
-        <div class="acc-item" id="acc-opts">
-          <div class="acc-header" onclick="accToggle('acc-opts')">
-            <div class="acc-header-left">
-              <span>⚙ Options</span>
-              <div class="acc-summary" id="summary-opts"></div>
-            </div>
-            <span class="acc-chevron">▼</span>
-          </div>
-          <div class="acc-body"><div class="acc-body-inner">
-            ${togChecked('allow-all', '--allow-all', 'Auto-approve all permissions', 'updateAllSummaries()')}
-            ${tog('no-commit', '--no-commit', 'Skip auto-commit after each iteration', 'updateAllSummaries()')}
-            ${tog('no-plugins', '--no-plugins', 'Disable OpenCode plugins', 'updateAllSummaries()')}
-            ${tog('no-stream', '--no-stream', 'Buffer output, print at end', 'updateAllSummaries()')}
-            ${tog('verbose-tools', '--verbose-tools', 'Print every tool call in detail', 'updateAllSummaries()')}
-            ${tog('no-questions', '--no-questions', 'Disable interactive questions', 'updateAllSummaries()')}
-          </div></div>
-        </div>
-
-        <!-- Advanced -->
-        <div class="acc-item" id="acc-adv">
-          <div class="acc-header" onclick="accToggle('acc-adv')">
-            <div class="acc-header-left">
-              <span>🔧 Advanced</span>
-              <div class="acc-summary" id="summary-adv"></div>
-            </div>
-            <span class="acc-chevron">▼</span>
-          </div>
-          <div class="acc-body"><div class="acc-body-inner">
-            <div class="acc-form-row">
-              <div class="fg">
-                <label>Preset name</label>
-                <input type="text" name="preset" id="preset"
-                  placeholder="Load from .ralph/presets.json" oninput="updateAllSummaries()">
-              </div>
-              <div class="fg">
-                <label>Project directory</label>
-                <div class="input-row">
-                  <input type="text" name="cwd" id="cwd"
-                    value="${escapeHtml(loadCurrentProject(cwd))}"
-                    placeholder="${escapeHtml(cwd)}">
-                  <button type="button" class="btn btn-ghost btn-sm" onclick="openDirModal()"
-                    title="Browse for a directory">📁</button>
-                </div>
-                <div id="project-card" style="display:none;margin-top:8px" class="project-card"></div>
-              </div>
-            </div>
-          </div></div>
-        </div>
-
-      </div><!-- /.acc-list -->
+      <!-- Right: Options -->
+      <div class="launch-panel launch-panel-right">
+        <div class="launch-panel-title">Options</div>
+        ${togChecked("allow-all", "--allow-all", "Auto-approve permissions", "void 0")}
+        ${tog("no-commit", "--no-commit", "Skip auto-commit", "void 0")}
+        ${tog("no-plugins", "--no-plugins", "Disable plugins", "void 0")}
+        ${tog("no-stream", "--no-stream", "Buffer output", "void 0")}
+        ${tog("verbose-tools", "--verbose-tools", "Verbose tool calls", "void 0")}
+        ${tog("no-questions", "--no-questions", "Disable questions", "void 0")}
+      </div>
 
       <!-- Submit -->
       <div class="launch-submit">
@@ -1884,309 +1915,76 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
     </div><!-- /.launch-wrap -->
     </form>
 
-    <!-- Directory browser modal -->
-    <div class="dir-modal-overlay" id="dir-modal">
-      <div class="dir-modal">
-        <div class="dir-modal-header">
-          📁 Select Project Directory
-          <button class="dir-modal-close" onclick="closeDirModal()">×</button>
-        </div>
-        <div class="dir-modal-path" id="dir-current-path"></div>
-        <div class="dir-modal-list" id="dir-list"></div>
-        <div class="dir-modal-footer">
-          <button class="btn btn-primary btn-sm" onclick="selectCurrentDir()">Select this folder</button>
-          <button class="btn btn-ghost btn-sm" onclick="closeDirModal()">Cancel</button>
-        </div>
-      </div>
-    </div>
-
     <script>
       const initialCwd = ${JSON.stringify(loadCurrentProject(cwd))};
-      let currentBrowsePath = initialCwd;
       const IS_WINDOWS = ${JSON.stringify(process.platform === "win32")};
 
-      // ── Accordion ─────────────────────────────────────────────
-      function accToggle(id) {
-        document.getElementById(id).classList.toggle('open');
-      }
-
-      // ── Summary tags ────────────────────────────────────────────
-      function tag(t) { return '<span class="acc-tag">' + t + '</span>'; }
-      function updateAllSummaries() {
-        // Agent summary
-        const agentVal = document.getElementById('agent').value;
-        const modelVal = document.getElementById('model').value.trim();
-        const agentTags = [];
-        if (agentVal) agentTags.push(tag(agentVal));
-        if (modelVal) agentTags.push(tag(modelVal.split('/').pop()));
-        const sAgent = document.getElementById('summary-agent');
-        if (sAgent) sAgent.innerHTML = agentTags.join('');
-
-        // Iter summary
-        const maxI = document.getElementById('max-iterations').value;
-        const minI = document.getElementById('min-iterations').value;
-        const iterTags = [];
-        if (maxI) iterTags.push(tag('max:' + maxI));
-        if (minI && minI !== '1') iterTags.push(tag('min:' + minI));
-        const sIter = document.getElementById('summary-iter');
-        if (sIter) sIter.innerHTML = iterTags.join('');
-
-        // Modes summary
-        const modeNames = ['plan','tasks','improving','optimize','diff'];
-        const modeTags = modeNames
-          .filter(n => { const el = document.querySelector('[name="' + n + '"]'); return el && el.checked; })
-          .map(n => tag('--' + n));
-        const sModes = document.getElementById('summary-modes');
-        if (sModes) sModes.innerHTML = modeTags.join('');
-
-        // Opts summary
-        const optNames = ['no-commit','no-plugins','no-stream','verbose-tools','no-questions'];
-        const optTags = optNames
-          .filter(n => { const el = document.querySelector('[name="' + n + '"]'); return el && el.checked; })
-          .map(n => tag('--' + n));
-        const allowAll = document.querySelector('[name="allow-all"]');
-        if (allowAll && !allowAll.checked) optTags.unshift(tag('no --allow-all'));
-        const sOpts = document.getElementById('summary-opts');
-        if (sOpts) sOpts.innerHTML = optTags.join('');
-
-        // Adv summary
-        const presetVal = document.getElementById('preset').value.trim();
-        const sAdv = document.getElementById('summary-adv');
-        if (sAdv) sAdv.innerHTML = presetVal ? tag(presetVal) : '';
-      }
-      updateAllSummaries();
-
-      // Improving cycles toggle
       function updateImprovingCycles() {
-        const cb = document.getElementById('improving-cb');
-        const row = document.getElementById('improving-cycles-row');
-        if (row) row.style.display = cb && cb.checked ? 'block' : 'none';
-        const opt = document.getElementById('prompt-optional');
-        if (opt) opt.style.display = cb && cb.checked ? 'inline' : 'none';
+        const cb = document.getElementById("improving-cb");
+        const row = document.getElementById("improving-cycles-row");
+        if (row) row.style.display = cb && cb.checked ? "block" : "none";
+        const opt = document.getElementById("prompt-optional");
+        if (opt) opt.style.display = cb && cb.checked ? "inline" : "none";
       }
 
-      // Optimize toggle
-      const agentSel = document.getElementById('agent');
-      const optimizeLabel = document.getElementById('optimize-label');
+      const agentSel = document.getElementById("agent");
       function updateOptimize() {
         const v = agentSel.value;
-        const dim = v !== '' && v !== 'llm';
-        if (optimizeLabel) optimizeLabel.style.opacity = dim ? '0.4' : '1';
-        const cb = document.getElementById('optimize-cb');
+        const dim = v !== "" && v !== "llm";
+        const lbl = document.getElementById("optimize-cb")?.closest(".toggle-row");
+        if (lbl) lbl.style.opacity = dim ? "0.4" : "1";
+        const cb = document.getElementById("optimize-cb");
         if (cb) cb.disabled = dim;
       }
-      agentSel.addEventListener('change', updateOptimize);
+      agentSel.addEventListener("change", updateOptimize);
       updateOptimize();
 
-      // Directory browser
-      async function openDirModal() {
-        if (IS_WINDOWS) {
-          const btn = document.querySelector('[onclick="openDirModal()"]');
-          if (btn) { btn.textContent = '⏳'; btn.disabled = true; }
-          try {
-            const resp = await fetch('/api/browse-native');
-            const data = await resp.json();
-            if (data.path) {
-              document.getElementById('cwd').value = data.path;
-              fetch('/api/set-project', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: data.path }) }).catch(() => {});
-              loadProjectInfo(data.path);
-            }
-          } catch (e) {
-            alert('Could not open folder picker: ' + e.message);
-          } finally {
-            if (btn) { btn.textContent = '📁'; btn.disabled = false; }
-          }
-          return;
-        }
-        const cwdInput = document.getElementById('cwd').value.trim() || initialCwd;
-        document.getElementById('dir-modal').classList.add('open');
-        browseTo(cwdInput);
-      }
-      function closeDirModal() { document.getElementById('dir-modal').classList.remove('open'); }
-      function selectCurrentDir() {
-        document.getElementById('cwd').value = currentBrowsePath;
-        closeDirModal();
-        fetch('/api/set-project', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: currentBrowsePath }) }).catch(() => {});
-        loadProjectInfo(currentBrowsePath);
-      }
-      async function browseTo(path) {
-        const pathEl = document.getElementById('dir-current-path');
-        const listEl = document.getElementById('dir-list');
-        pathEl.textContent = 'Loading…';
-        listEl.innerHTML = '';
-        try {
-          const resp = await fetch('/api/browse?path=' + encodeURIComponent(path));
-          const data = await resp.json();
-          if (data.error) { pathEl.textContent = 'Error: ' + data.error; return; }
-          currentBrowsePath = data.current;
-          pathEl.textContent = data.current;
-          if (data.parent) {
-            const up = document.createElement('div');
-            up.className = 'dir-item dir-item-up';
-            up.innerHTML = '<span class="dir-item-icon">⬆</span><span class="dir-item-name">.. (parent)</span>';
-            up.onclick = () => browseTo(data.parent);
-            listEl.appendChild(up);
-          }
-          if (data.dirs.length === 0 && !data.parent) {
-            listEl.innerHTML = '<p style="color:var(--text-muted);padding:12px;font-size:13px">No subdirectories.</p>';
-          } else {
-            data.dirs.forEach(d => {
-              const item = document.createElement('div');
-              item.className = 'dir-item';
-              const icon = d.name.startsWith('.') ? '📂' : '📁';
-              item.innerHTML = '<span class="dir-item-icon">' + icon + '</span><span class="dir-item-name">' + d.name + '</span>';
-              item.ondblclick = () => browseTo(d.path);
-              item.onclick = () => {
-                listEl.querySelectorAll('.dir-item').forEach(el => el.style.background = '');
-                item.style.background = 'var(--accent-dim)';
-                currentBrowsePath = d.path;
-                document.getElementById('dir-current-path').textContent = d.path;
-              };
-              listEl.appendChild(item);
-            });
-          }
-        } catch (e) { pathEl.textContent = 'Failed to load: ' + e.message; }
-      }
-      document.getElementById('dir-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeDirModal();
-      });
-
-      // Ollama model fetch
       async function fetchModels() {
-        const url = document.getElementById('base-url').value.trim();
-        if (!url) { alert('Enter a Base URL first (e.g. http://localhost:11434/v1)'); return; }
-        const btn = document.getElementById('fetch-models-btn');
-        btn.textContent = '⏳ Fetching…';
-        btn.disabled = true;
+        const url = document.getElementById("base-url").value.trim();
+        if (!url) { alert("Enter a Base URL first"); return; }
+        const btn = document.getElementById("fetch-models-btn");
+        btn.textContent = "..."; btn.disabled = true;
         try {
-          const resp = await fetch('/api/models?url=' + encodeURIComponent(url));
-          const models = await resp.json();
-          const dl = document.getElementById('model-suggestions');
-          dl.innerHTML = '';
-          if (models.length === 0) { alert('No models found at that URL.'); return; }
-          models.forEach(m => {
-            const opt = document.createElement('option');
-            opt.value = m;
-            dl.appendChild(opt);
-          });
-          btn.textContent = '✓ ' + models.length + ' models';
-        } catch (e) {
-          alert('Failed to fetch models: ' + e.message);
-          btn.textContent = '↓ Models';
-        } finally { btn.disabled = false; }
+          const models = await (await fetch("/api/models?url=" + encodeURIComponent(url))).json();
+          const dl = document.getElementById("model-suggestions");
+          dl.innerHTML = "";
+          if (models.length === 0) { alert("No models found."); return; }
+          models.forEach(m => { const o = document.createElement("option"); o.value = m; dl.appendChild(o); });
+          btn.textContent = "✓ " + models.length;
+        } catch (e) { alert("Failed: " + e.message); btn.textContent = "↓"; }
+        finally { btn.disabled = false; }
       }
 
-      // Prompt enrichment
       async function enrichPrompt() {
-        const btn = document.getElementById('enrich-btn');
-        const status = document.getElementById('enrich-status');
-        const ta = document.getElementById('prompt');
+        const btn = document.getElementById("enrich-btn");
+        const status = document.getElementById("enrich-status");
+        const ta = document.getElementById("prompt");
         const rawPrompt = ta.value.trim();
         if (!rawPrompt) { ta.focus(); return; }
-        const baseUrl = document.getElementById('base-url').value.trim();
-        const model   = document.getElementById('model').value.trim();
-        btn.disabled = true;
-        btn.textContent = '⏳ Enriching…';
-        status.style.display = 'inline';
-        status.style.color = 'var(--text-muted)';
-        status.textContent = 'Sending to LLM…';
+        btn.disabled = true; btn.textContent = "Enriching...";
+        status.style.display = "inline"; status.style.color = "var(--text-muted)"; status.textContent = "Sending to LLM...";
         try {
-          const agent = document.getElementById('agent').value.trim();
-          const resp = await fetch('/api/enrich-prompt', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: rawPrompt, agent: agent || undefined, model: model || undefined, baseUrl: baseUrl || undefined }),
+          const resp = await fetch("/api/enrich-prompt", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt: rawPrompt,
+              agent: document.getElementById("agent").value.trim() || undefined,
+              model: document.getElementById("model").value.trim() || undefined,
+              baseUrl: document.getElementById("base-url").value.trim() || undefined,
+            }),
           });
           const d = await resp.json();
-          if (d.error) {
-            status.style.color = 'var(--danger)';
-            status.textContent = '✗ ' + d.error;
-          } else {
-            ta.value = d.prompt;
-            status.style.color = 'var(--success)';
-            status.textContent = '✓ Enriched';
-            setTimeout(() => { status.style.display = 'none'; }, 3000);
-          }
-        } catch (e) {
-          status.style.color = 'var(--danger)';
-          status.textContent = '✗ ' + e.message;
-        } finally {
-          btn.disabled = false;
-          btn.textContent = '✨ Enrich';
-        }
+          if (d.error) { status.style.color = "var(--danger)"; status.textContent = "✗ " + d.error; }
+          else { ta.value = d.prompt; status.style.color = "var(--success)"; status.textContent = "✓ Enriched"; setTimeout(() => { status.style.display = "none"; }, 3000); }
+        } catch (e) { status.style.color = "var(--danger)"; status.textContent = "✗ " + e.message; }
+        finally { btn.disabled = false; btn.textContent = "✨ Enrich"; }
       }
 
-      // Warn if loop already running
-      document.getElementById('launch-form').addEventListener('submit', function(e) {
-        if (document.querySelector('.alert-warning')) {
-          if (!confirm('A loop is already running. Launch another anyway?')) e.preventDefault();
+      document.getElementById("launch-form").addEventListener("submit", function(e) {
+        if (document.querySelector(".alert-warning")) {
+          if (!confirm("A loop is already running. Launch another anyway?")) e.preventDefault();
         }
       });
-
-      // Project info card
-      let _projInfoTimer = null;
-      document.getElementById('cwd').addEventListener('input', function() {
-        clearTimeout(_projInfoTimer);
-        const path = this.value.trim();
-        _projInfoTimer = setTimeout(() => {
-          fetch('/api/set-project', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd: path }) }).catch(() => {});
-          loadProjectInfo(path);
-        }, 700);
-      });
-
-      async function loadProjectInfo(path) {
-        if (!path) return;
-        const card = document.getElementById('project-card');
-        card.style.display = 'block';
-        card.innerHTML = '<p class="project-card-loading">⏳ Loading project info…</p>';
-        try {
-          const resp = await fetch('/api/project-info?cwd=' + encodeURIComponent(path));
-          const d = await resp.json();
-          if (d.error) { card.innerHTML = '<p class="project-card-loading" style="color:var(--text-muted)">⚠ ' + esc(d.error) + '</p>'; return; }
-          let html = '<div class="project-info-header"><span class="project-name">' + esc(d.name) + '</span>';
-          if (d.version) html += '<span class="project-version">v' + esc(d.version) + '</span>';
-          if (d.gitBranch) html += '<span class="badge badge-gray" style="font-size:10px">⎇ ' + esc(d.gitBranch) + '</span>';
-          if (d.hasPlan)     html += '<span class="badge badge-blue" style="font-size:10px">📋 Plan</span>';
-          if (d.hasActivity) html += '<span class="badge badge-blue" style="font-size:10px">📝 Activity</span>';
-          html += '</div>';
-          if (d.description) html += '<p class="project-desc">' + esc(d.description) + '</p>';
-          if (d.lastRun) {
-            const ago = d.lastRun.startedAt ? timeAgo(new Date(d.lastRun.startedAt)) : '';
-            html += '<div class="project-last-run"><span style="font-size:11px;color:var(--text-muted)">Last run' + (ago ? ' · ' + ago : '') + ':</span>'
-              + ' <strong style="font-size:11px">' + esc(d.lastRun.agent || '?') + '</strong>'
-              + (d.lastRun.iteration ? ' · <span style="font-size:11px">' + d.lastRun.iteration + ' iterations</span>' : '');
-            if (d.lastRun.prompt) {
-              const p = String(d.lastRun.prompt);
-              const safeP = p.replace(/&/g,'&amp;').replace(/"/g,'&quot;');
-              html += '<div class="project-last-prompt">' + esc(p.substring(0, 140)) + (p.length > 140 ? '…' : '') + '</div>'
-                + '<button type="button" class="btn btn-ghost btn-sm" style="margin-top:8px" '
-                + 'data-prompt="' + safeP + '" onclick="resumeLastRun(this.dataset.prompt)">↩ Resume last run</button>';
-            }
-            html += '</div>';
-          } else {
-            html += '<p class="project-desc" style="margin-top:6px">No previous runs in this directory.</p>';
-          }
-          card.innerHTML = html;
-        } catch (e) { card.style.display = 'none'; }
-      }
-
-      function resumeLastRun(prompt) {
-        document.getElementById('prompt').value = prompt;
-        document.getElementById('prompt').focus();
-      }
-
-      function timeAgo(date) {
-        const s = Math.floor((Date.now() - date.getTime()) / 1000);
-        if (s < 60) return s + 's ago';
-        if (s < 3600) return Math.floor(s / 60) + 'm ago';
-        if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-        return Math.floor(s / 86400) + 'd ago';
-      }
-
-      function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-      // Load project info on initial page load
-      loadProjectInfo(initialCwd);
     </script>
   `, "/launch", "", state);
 }
@@ -2307,7 +2105,6 @@ function routeStatus(cwd: string): string {
         <button class="btn btn-ghost btn-sm" onclick="location.reload()">↻ Refresh</button>
       </div>
     </div>
-    ${projectSelectorBar(projectCwd, IS_WIN)}
     ${stateHtml}
     <h2>Recent Iterations</h2>
     ${historyHtml}
@@ -2376,7 +2173,6 @@ function routePlan(cwd: string): string {
   const state = loadState(projectCwd);
   const isActive = state?.active === true;
   const IS_WIN = process.platform === "win32";
-  const selectorBar = projectSelectorBar(projectCwd, IS_WIN);
   const planContent = readFileSafe(planPath(projectCwd));
   const archived = loadArchivedCycles(projectCwd);
 
@@ -2389,7 +2185,6 @@ function routePlan(cwd: string): string {
       </div>
       <p class="page-subtitle">IMPLEMENTATION_PLAN.md — maintained by the agent</p>
     </div>
-    ${selectorBar}
     ${buildPlanContentHtml(planContent, isActive, archived)}
     <script>
       ${isActive ? `
@@ -2602,8 +2397,7 @@ function routeActivity(cwd: string): string {
   </script>` : "";
 
   const IS_WIN = process.platform === "win32";
-  const selectorBar = projectSelectorBar(projectCwd, IS_WIN);
-  const bodyHtml = selectorBar + buildActivityHtml(projectCwd, state);
+  const bodyHtml = buildActivityHtml(projectCwd, state);
   return htmlPage("Activity", bodyHtml, "/activity", extraHead, state, projectCwd);
 }
 
@@ -2999,6 +2793,16 @@ function routeApiConsoleLog(cwd: string): Response {
   const lp = logPath(loadCurrentProject(cwd));
   const content = existsSync(lp) ? lastNLines(readFileSafe(lp), 200) : "";
   return new Response(content, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+}
+
+// ─── Route: GET /api/project-name ────────────────────────────────────────────
+
+function routeApiProjectName(cwd: string): Response {
+  const projectCwd = loadCurrentProject(cwd);
+  const name = projectCwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? projectCwd;
+  return new Response(JSON.stringify({ cwd: projectCwd, name }), {
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 // ─── Route: POST /api/set-project ────────────────────────────────────────────
@@ -3463,6 +3267,7 @@ export async function startDashboard(port: number, openBrowser: boolean, cwd: st
       if (path === "/api/activity-data")  return routeApiActivityData(cwd);
       if (path === "/api/plan-data")      return routeApiPlanData(cwd);
       if (path === "/api/set-project" && req.method === "POST") return routeApiSetProject(req, cwd);
+      if (path === "/api/project-name") return routeApiProjectName(cwd);
       if (path === "/intervene") {
         if (req.method === "POST") return routeIntervenePost(req, cwd);
         let flash: { type: string; message: string } | undefined;
