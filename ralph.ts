@@ -2045,6 +2045,15 @@ function buildPrompt(state: RalphState, _agent: AgentConfig, gitIssues: string[]
     if (customPrompt) return customPrompt;
   }
 
+  // Testing mode: use the prompt as-is — no plan injection, no loop boilerplate, no tasks section.
+  // The testing/fixing prompts are self-contained and adding the standard template on top
+  // creates conflicting instruction sets that confuse the agent.
+  if (state.testingMode) {
+    const context = loadContext();
+    const contextSection = context ? `\n\n## Additional Context (added by user mid-loop)\n\n${context}\n` : "";
+    return `${state.prompt}${contextSection}`.trim();
+  }
+
   // Optimized prompt for small/weak models: minimal context, no noise, signal at the end
   if (state.optimize) {
     const context = loadContext();
