@@ -3163,64 +3163,95 @@ Write as a single cohesive block of paragraphs — no markdown headers, no bulle
 
 
 
+  // Helper to call Anthropic API
+  async function callAnthropic(apiKey: string, model: string): Promise<string> {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 2000,
+        system: systemPrompt,
+        messages: [{ role: "user", content: rawPrompt }],
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(`Anthropic API error ${resp.status}: ${txt.slice(0, 200)}`);
+    }
+    const data = await resp.json() as { content?: Array<{ type: string; text?: string }> };
+    return data?.content?.find(b => b.type === "text")?.text?.trim() ?? "";
+  }
+
+  // Helper to call OpenAI-compatible API
+  async function callOpenAICompat(apiBase: string, apiKey: string, model: string): Promise<string> {
+    const base = apiBase.endsWith("/v1") ? apiBase : `${apiBase}/v1`;
+    const resp = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: rawPrompt },
+        ],
+        max_tokens: 2000,
+        temperature: 0.3,
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(`API error ${resp.status}: ${txt.slice(0, 200)}`);
+    }
+    const data = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
+    return data?.choices?.[0]?.message?.content?.trim() ?? "";
+  }
+
   try {
     let enriched = "";
 
     if (useAnthropicKey) {
-      // ── Anthropic Messages API ────────────────────────────────────
       const model = resolvedModel || "claude-haiku-4-5-20251001";
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": effectiveAnthropicKey!,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: 2000,
-          system: systemPrompt,
-          messages: [{ role: "user", content: rawPrompt }],
-        }),
-        signal: AbortSignal.timeout(120_000),
-      });
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => "");
-        return new Response(JSON.stringify({ error: `Anthropic API error ${resp.status}: ${txt.slice(0, 200)}` }), {
-          status: 502, headers: { "Content-Type": "application/json" },
-        });
+      enriched = await callAnthropic(effectiveAnthropicKey!, model);
+    } else if (resolvedBaseUrl) {
+      // Local/custom base URL — try it; if unreachable, fall back to cloud keys
+      const apiKey = process.env.OPENAI_API_KEY ?? "local";
+      const model  = resolvedModel || "default";
+      try {
+        enriched = await callOpenAICompat(resolvedBaseUrl, apiKey, model);
+      } catch (localErr: any) {
+        const msg = String(localErr?.message ?? localErr);
+        const isConnErr = msg.includes("connect") || msg.includes("ECONNREFUSED") || msg.includes("Unable to connect") || msg.includes("ENOTFOUND");
+        if (!isConnErr) throw localErr; // real error, re-throw
+
+        // Local LLM unreachable — try cloud fallback
+        if (process.env.ANTHROPIC_API_KEY) {
+          const fallbackModel = resolvedModel.toLowerCase().includes("claude") ? resolvedModel : "claude-haiku-4-5-20251001";
+          try {
+            enriched = await callAnthropic(process.env.ANTHROPIC_API_KEY, fallbackModel);
+          } catch {
+            throw new Error(`Cannot reach local LLM at ${resolvedBaseUrl} and Anthropic fallback also failed. Check that your LLM server is running.`);
+          }
+        } else if (process.env.OPENAI_API_KEY) {
+          try {
+            enriched = await callOpenAICompat("https://api.openai.com/v1", process.env.OPENAI_API_KEY, resolvedModel || "gpt-4o-mini");
+          } catch {
+            throw new Error(`Cannot reach local LLM at ${resolvedBaseUrl} and OpenAI fallback also failed.`);
+          }
+        } else {
+          throw new Error(`Cannot reach local LLM at ${resolvedBaseUrl}. Is the server running? (e.g. ollama serve)`);
+        }
       }
-      const data = await resp.json() as { content?: Array<{ type: string; text?: string }> };
-      enriched = data?.content?.find(b => b.type === "text")?.text?.trim() ?? "";
     } else {
-      // ── OpenAI-compatible API ─────────────────────────────────────
-      const apiBase = resolvedBaseUrl
-        ? (resolvedBaseUrl.endsWith("/v1") ? resolvedBaseUrl : `${resolvedBaseUrl}/v1`)
-        : "https://api.openai.com/v1";
-      const apiKey  = process.env.OPENAI_API_KEY ?? "local";
-      const model   = resolvedModel || (resolvedBaseUrl ? undefined : "gpt-4o-mini");
-      const resp = await fetch(`${apiBase}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: model ?? "gpt-4o-mini",
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: rawPrompt },
-          ],
-          max_tokens: 2000,
-          temperature: 0.3,
-        }),
-        signal: AbortSignal.timeout(120_000),
-      });
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => "");
-        return new Response(JSON.stringify({ error: `LLM API error ${resp.status}: ${txt.slice(0, 200)}` }), {
-          status: 502, headers: { "Content-Type": "application/json" },
-        });
-      }
-      const data = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
-      enriched = data?.choices?.[0]?.message?.content?.trim() ?? "";
+      // OpenAI API (OPENAI_API_KEY)
+      const model = resolvedModel || "gpt-4o-mini";
+      enriched = await callOpenAICompat("https://api.openai.com/v1", process.env.OPENAI_API_KEY!, model);
     }
 
     if (!enriched) {
@@ -3228,8 +3259,14 @@ Write as a single cohesive block of paragraphs — no markdown headers, no bulle
     }
 
     return new Response(JSON.stringify({ prompt: enriched }), { headers: { "Content-Type": "application/json" } });
-  } catch (e) {
-    return new Response(JSON.stringify({ error: `Request failed: ${String(e)}` }), { status: 502, headers: { "Content-Type": "application/json" } });
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    const isConnErr = msg.includes("connect") || msg.includes("ECONNREFUSED") || msg.includes("Unable to connect") || msg.includes("ENOTFOUND");
+    const attempted = useAnthropicKey ? "https://api.anthropic.com" : (resolvedBaseUrl || "https://api.openai.com");
+    const friendly = isConnErr
+      ? `Cannot reach ${attempted}. ${resolvedBaseUrl ? "Is the local LLM server running?" : "Check your internet/API key."}`
+      : msg;
+    return new Response(JSON.stringify({ error: friendly }), { status: 502, headers: { "Content-Type": "application/json" } });
   }
 }
 
