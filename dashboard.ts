@@ -2019,6 +2019,7 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
               agent: document.getElementById("agent").value.trim() || undefined,
               model: document.getElementById("model").value.trim() || undefined,
               baseUrl: document.getElementById("base-url").value.trim() || undefined,
+              apiKey: document.getElementById("api-key").value.trim() || undefined,
             }),
           });
           const d = await resp.json();
@@ -3045,6 +3046,7 @@ async function callAgentCliEnrich(
   model: string,
   baseUrl: string,
   projectCwd: string,
+  apiKey = "",
 ): Promise<string> {
   const toolRestriction = `\n\n⚠️ TOOL USE RESTRICTION: This is a text-only task. Do NOT write or read files, run commands, or make any codebase changes. Output ONLY the enriched task specification text.\n\nTASK TO ENRICH:\n${userPrompt}`;
   const fullPrompt = `${systemPrompt}${toolRestriction}`;
@@ -3099,12 +3101,17 @@ async function callAgentCliEnrich(
       throw new Error(`Unknown agent type: ${agentType}`);
   }
 
+  const spawnEnv: Record<string, string> = { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" };
+  if (apiKey && (agentType === "aider" || agentType === "llm")) {
+    spawnEnv.OPENAI_API_KEY = apiKey;
+  }
+
   const proc = Bun.spawn([binary, ...args], {
     cwd: projectCwd,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+    env: spawnEnv,
   });
   proc.stdin.end();
 
@@ -3282,7 +3289,7 @@ Write as a single cohesive block of paragraphs — no markdown headers, no bulle
 }
 
 async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Response> {
-  let body: { prompt?: string; baseUrl?: string; model?: string; agent?: string } = {};
+  let body: { prompt?: string; baseUrl?: string; model?: string; agent?: string; apiKey?: string } = {};
   try { body = await req.json(); } catch {
     return new Response(JSON.stringify({ error: "Invalid JSON" }), { status: 400, headers: { "Content-Type": "application/json" } });
   }
@@ -3295,6 +3302,7 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
   const baseUrl  = String(body.baseUrl ?? "").trim().replace(/\/+$/, "");
   const agent    = String(body.agent  ?? "").trim();
   const modelRaw = String(body.model  ?? "").trim();
+  const apiKey   = String(body.apiKey ?? "").trim();
 
   // ── Resolve which backend to use ─────────────────────────────────────────
   // Priority:
@@ -3311,7 +3319,7 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
     const context = buildEnrichmentContext(projectCwd);
     const systemPrompt2 = buildEnrichSystemPrompt(context);
     try {
-      const enriched = await callAgentCliEnrich(effectiveAgent, systemPrompt2, rawPrompt, modelRaw, baseUrl, projectCwd);
+      const enriched = await callAgentCliEnrich(effectiveAgent, systemPrompt2, rawPrompt, modelRaw, baseUrl, projectCwd, apiKey);
       if (enriched && enriched.length > 80) {
         return new Response(JSON.stringify({ prompt: enriched }), { headers: { "Content-Type": "application/json" } });
       }
@@ -3422,10 +3430,10 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
       enriched = await callAnthropic(effectiveAnthropicKey!, model);
     } else if (resolvedBaseUrl) {
       // Local/custom base URL — try it; if unreachable, fall back to cloud keys
-      const apiKey = process.env.OPENAI_API_KEY ?? "local";
+      const effectiveApiKey = apiKey || process.env.OPENAI_API_KEY || "local";
       const model  = resolvedModel || "default";
       try {
-        enriched = await callOpenAICompat(resolvedBaseUrl, apiKey, model);
+        enriched = await callOpenAICompat(resolvedBaseUrl, effectiveApiKey, model);
       } catch (localErr: any) {
         const msg = String(localErr?.message ?? localErr);
         const isConnErr = msg.includes("connect") || msg.includes("ECONNREFUSED") || msg.includes("Unable to connect") || msg.includes("ENOTFOUND");
