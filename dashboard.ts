@@ -1900,6 +1900,10 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
             <div class="fg">
               <label>API Key <span style="opacity:.6">(Authorization)</span></label>
               <input type="password" name="api-key" id="api-key" placeholder="Bearer token / API key">
+              <label class="cb-label" style="margin-top:4px;font-size:12px">
+                <input type="checkbox" name="auth-header" id="auth-header-cb">
+                Send as <code>Authorization: Bearer</code> header
+              </label>
             </div>
             <div class="fg">
               <label>Rotation</label>
@@ -1993,7 +1997,11 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
         const btn = document.getElementById("fetch-models-btn");
         btn.textContent = "..."; btn.disabled = true;
         try {
-          const models = await (await fetch("/api/models?url=" + encodeURIComponent(url))).json();
+          const authKey = document.getElementById("auth-header-cb").checked
+            ? (document.getElementById("api-key").value.trim() || "")
+            : "";
+          const modelsUrl = "/api/models?url=" + encodeURIComponent(url) + (authKey ? "&authKey=" + encodeURIComponent(authKey) : "");
+          const models = await (await fetch(modelsUrl)).json();
           const dl = document.getElementById("model-suggestions");
           dl.innerHTML = "";
           if (models.length === 0) { alert("No models found."); return; }
@@ -2020,6 +2028,7 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
               model: document.getElementById("model").value.trim() || undefined,
               baseUrl: document.getElementById("base-url").value.trim() || undefined,
               apiKey: document.getElementById("api-key").value.trim() || undefined,
+              sendAuthHeader: document.getElementById("auth-header-cb").checked || undefined,
             }),
           });
           const d = await resp.json();
@@ -3289,7 +3298,7 @@ Write as a single cohesive block of paragraphs — no markdown headers, no bulle
 }
 
 async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Response> {
-  let body: { prompt?: string; baseUrl?: string; model?: string; agent?: string; apiKey?: string } = {};
+  let body: { prompt?: string; baseUrl?: string; model?: string; agent?: string; apiKey?: string; sendAuthHeader?: boolean } = {};
   try { body = await req.json(); } catch {
     return new Response(JSON.stringify({ error: "Invalid JSON" }), { status: 400, headers: { "Content-Type": "application/json" } });
   }
@@ -3302,7 +3311,8 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
   const baseUrl  = String(body.baseUrl ?? "").trim().replace(/\/+$/, "");
   const agent    = String(body.agent  ?? "").trim();
   const modelRaw = String(body.model  ?? "").trim();
-  const apiKey   = String(body.apiKey ?? "").trim();
+  const apiKey          = String(body.apiKey ?? "").trim();
+  const sendAuthHeader  = !!body.sendAuthHeader;
 
   // ── Resolve which backend to use ─────────────────────────────────────────
   // Priority:
@@ -3398,11 +3408,14 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
   }
 
   // Helper to call OpenAI-compatible API
-  async function callOpenAICompat(apiBase: string, apiKey: string, model: string): Promise<string> {
+  async function callOpenAICompat(apiBase: string, apiKey: string, model: string, forceAuth = false): Promise<string> {
     const base = apiBase.endsWith("/v1") ? apiBase : `${apiBase}/v1`;
+    const useAuth = forceAuth || (sendAuthHeader && !!apiKey && apiKey !== "local");
+    const fetchHeaders: Record<string, string> = { "Content-Type": "application/json" };
+    if (useAuth) fetchHeaders["Authorization"] = `Bearer ${apiKey}`;
     const resp = await fetch(`${base}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      headers: fetchHeaders,
       body: JSON.stringify({
         model,
         messages: [
@@ -3449,7 +3462,7 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
           }
         } else if (process.env.OPENAI_API_KEY) {
           try {
-            enriched = await callOpenAICompat("https://api.openai.com/v1", process.env.OPENAI_API_KEY, resolvedModel || "gpt-4o-mini");
+            enriched = await callOpenAICompat("https://api.openai.com/v1", process.env.OPENAI_API_KEY, resolvedModel || "gpt-4o-mini", true);
           } catch {
             throw new Error(`Cannot reach local LLM at ${resolvedBaseUrl} and OpenAI fallback also failed.`);
           }
@@ -3460,7 +3473,7 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
     } else {
       // OpenAI API (OPENAI_API_KEY)
       const model = resolvedModel || "gpt-4o-mini";
-      enriched = await callOpenAICompat("https://api.openai.com/v1", process.env.OPENAI_API_KEY!, model);
+      enriched = await callOpenAICompat("https://api.openai.com/v1", process.env.OPENAI_API_KEY!, model, true);
     }
 
     if (!enriched) {
@@ -3482,7 +3495,9 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
 // ─── Route: GET /api/models ───────────────────────────────────────────────────
 
 async function routeApiModels(req: Request): Promise<Response> {
-  const url = new URL(req.url).searchParams.get("url") ?? "";
+  const params = new URL(req.url).searchParams;
+  const url     = params.get("url") ?? "";
+  const authKey = params.get("authKey") ?? "";
   if (!url) {
     return new Response(JSON.stringify([]), {
       headers: { "Content-Type": "application/json" },
@@ -3490,8 +3505,11 @@ async function routeApiModels(req: Request): Promise<Response> {
   }
   const base = url.replace(/\/+$/, "").replace(/\/v1$/, "");
   try {
+    const fetchHeaders: Record<string, string> = {};
+    if (authKey) fetchHeaders["Authorization"] = `Bearer ${authKey}`;
     const resp = await fetch(`${base}/api/tags`, {
       signal: AbortSignal.timeout(8000),
+      headers: fetchHeaders,
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json() as { models?: Array<{ name: string }> };
