@@ -46,7 +46,7 @@ let initConfigPath = "";
 const AGENT_TYPES = ["opencode", "claude-code", "codex", "copilot", "aider", "llm"] as const;
 type AgentType = (typeof AGENT_TYPES)[number];
 
-type AgentEnvOptions = { filterPlugins?: boolean; allowAllPermissions?: boolean; baseUrl?: string; model?: string };
+type AgentEnvOptions = { filterPlugins?: boolean; allowAllPermissions?: boolean; baseUrl?: string; model?: string; apiKey?: string };
 
 type AgentBuildArgsOptions = { allowAllPermissions?: boolean; extraFlags?: string[]; streamOutput?: boolean; baseUrl?: string; optimize?: boolean };
 
@@ -214,12 +214,13 @@ const ARGS_TEMPLATES: Record<string, (prompt: string, model: string, options?: A
 const ENV_TEMPLATES: Record<string, (options: AgentEnvOptions) => Record<string, string>> = {
   "opencode": (options) => {
     const env = { ...process.env };
-    if (options.filterPlugins || options.allowAllPermissions || options.baseUrl) {
+    if (options.filterPlugins || options.allowAllPermissions || options.baseUrl || options.apiKey) {
       env.OPENCODE_CONFIG = ensureRalphConfig({
         filterPlugins: options.filterPlugins,
         allowAllPermissions: options.allowAllPermissions,
         baseUrl: options.baseUrl,
         model: options.model,
+        apiKey: options.apiKey,
       });
     }
     return env;
@@ -227,7 +228,8 @@ const ENV_TEMPLATES: Record<string, (options: AgentEnvOptions) => Record<string,
   "aider": (options) => {
     const env: Record<string, string> = { ...process.env };
     // Aider requires OPENAI_API_KEY to be set; use a placeholder for local models
-    if (!env.OPENAI_API_KEY) env.OPENAI_API_KEY = "local";
+    if (options.apiKey) env.OPENAI_API_KEY = options.apiKey;
+    else if (!env.OPENAI_API_KEY) env.OPENAI_API_KEY = "local";
     if (options.baseUrl) env.OPENAI_API_BASE = options.baseUrl;
     return env;
   },
@@ -235,7 +237,8 @@ const ENV_TEMPLATES: Record<string, (options: AgentEnvOptions) => Record<string,
     const env: Record<string, string> = { ...process.env };
     // For local servers no real key is needed; set a placeholder so llm-agent.ts
     // doesn't fall back to the OpenAI default.
-    if (!env.OPENAI_API_KEY && options.baseUrl) env.OPENAI_API_KEY = "local";
+    if (options.apiKey) env.OPENAI_API_KEY = options.apiKey;
+    else if (!env.OPENAI_API_KEY && options.baseUrl) env.OPENAI_API_KEY = "local";
     if (options.baseUrl) env.OPENAI_BASE_URL = options.baseUrl;
     return env;
   },
@@ -502,6 +505,9 @@ Arguments:
                       With --agent aider: passes --openai-api-base to aider
                       Example: ralph "task" --agent llm --model qwen2.5-coder \\
                                             --base-url http://localhost:11434/v1
+  --api-key KEY       API key / Bearer token for the model endpoint.
+                      Sets OPENAI_API_KEY for aider/llm agents and injects
+                      apiKey into opencode's provider config.
 
 ── Output & Permissions ─────────────────────────────────────────────────────────
   --no-stream         Buffer agent output and print at the end
@@ -1136,6 +1142,7 @@ let tasksMode = false;
 let taskPromise = "READY_FOR_NEXT_TASK";
 let model = "";
 let baseUrl = "";
+let apiKey = "";
 let agentType: AgentType = "opencode";
 let rotationInput = "";
 let rotation: string[] | null = null;
@@ -1263,6 +1270,13 @@ for (let i = 0; i < args.length; i++) {
       process.exit(1);
     }
     baseUrl = val;
+  } else if (arg === "--api-key") {
+    const val = args[++i];
+    if (!val) {
+      console.error("Error: --api-key requires a value");
+      process.exit(1);
+    }
+    apiKey = val;
   } else if (arg === "--prompt-file" || arg === "--file" || arg === "-f") {
     const val = args[++i];
     if (!val) {
@@ -1479,6 +1493,7 @@ interface RalphState {
   startedAt: string;
   model: string;
   baseUrl?: string;
+  apiKey?: string;
   agent: AgentType;
   rotation?: string[];
   rotationIndex?: number;
@@ -1539,7 +1554,7 @@ function loadPluginsFromConfig(configPath: string): string[] {
   }
 }
 
-function ensureRalphConfig(options: { filterPlugins?: boolean; allowAllPermissions?: boolean; baseUrl?: string; model?: string }): string {
+function ensureRalphConfig(options: { filterPlugins?: boolean; allowAllPermissions?: boolean; baseUrl?: string; model?: string; apiKey?: string }): string {
   if (!existsSync(stateDir)) {
     mkdirSync(stateDir, { recursive: true });
   }
@@ -1593,7 +1608,7 @@ function ensureRalphConfig(options: { filterPlugins?: boolean; allowAllPermissio
       [RALPH_PROVIDER_KEY]: {
         npm: "@ai-sdk/openai-compatible",
         name: "Ralph Local (OpenAI-compatible)",
-        options: { baseURL: baseWithV1 },
+        options: { baseURL: baseWithV1, ...(options.apiKey ? { apiKey: options.apiKey } : {}) },
         ...(Object.keys(models).length > 0 ? { models } : {}),
       },
     };
@@ -2635,6 +2650,7 @@ async function runRalphLoop(): Promise<void> {
     promptTemplatePath = existingState.promptTemplate ?? "";
     model = existingState.model;
     baseUrl = existingState.baseUrl ?? "";
+    apiKey = existingState.apiKey ?? "";
     agentType = existingState.agent;
     rotation = existingState.rotation ?? null;
     planMode = existingState.planMode ?? false;
@@ -2712,6 +2728,7 @@ async function runRalphLoop(): Promise<void> {
     startedAt: new Date().toISOString(),
     model: initialModel,
     baseUrl: baseUrl || undefined,
+    apiKey: apiKey || undefined,
     agent: initialAgentType,
     rotation: rotation ?? undefined,
     rotationIndex: rotationActive ? 0 : undefined,
@@ -2906,6 +2923,7 @@ async function runRalphLoop(): Promise<void> {
         filterPlugins: disablePlugins,
         allowAllPermissions: allowAllPermissions,
         baseUrl: state.baseUrl,
+        apiKey: state.apiKey,
         model: currentModel,
       });
 

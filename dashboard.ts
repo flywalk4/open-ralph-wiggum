@@ -280,6 +280,7 @@ async function launchRalph(formData: URLSearchParams, serverCwd: string): Promis
   add("--agent", formData.get("agent"));
   add("--model", formData.get("model"));
   add("--base-url", formData.get("base-url"));
+  add("--api-key", formData.get("api-key"));
   add("--max-iterations", formData.get("max-iterations"));
   add("--min-iterations", formData.get("min-iterations"));
   add("--completion-promise", formData.get("completion-promise"));
@@ -1895,6 +1896,10 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
                 <button type="button" class="btn btn-ghost btn-sm" id="fetch-models-btn"
                   onclick="fetchModels()" title="Fetch models">↓</button>
               </div>
+            </div>
+            <div class="fg">
+              <label>API Key <span style="opacity:.6">(Authorization)</span></label>
+              <input type="password" name="api-key" id="api-key" placeholder="Bearer token / API key">
             </div>
             <div class="fg">
               <label>Rotation</label>
