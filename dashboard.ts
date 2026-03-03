@@ -2018,7 +2018,7 @@ function routeLaunchGet(cwd: string, flash?: { type: string; message: string }):
           });
           const d = await resp.json();
           if (d.error) { status.style.color = "var(--danger)"; status.textContent = "✗ " + d.error; }
-          else { ta.value = d.prompt; status.style.color = "var(--success)"; status.textContent = "✓ Enriched"; setTimeout(() => { status.style.display = "none"; }, 3000); }
+          else { ta.value = d.prompt; status.style.color = "var(--success)"; status.textContent = "✓ Enriched"; setTimeout(() => { status.style.display = "none"; }, 3000000); }
         } catch (e) { status.style.color = "var(--danger)"; status.textContent = "✗ " + e.message; }
         finally { btn.disabled = false; btn.textContent = "✨ Enrich"; }
       }
@@ -3106,7 +3106,7 @@ async function callAgentCliEnrich(
   const decoder = new TextDecoder();
   const chunks: string[] = [];
   const reader = proc.stdout.getReader();
-  const cancel = new Promise<void>(r => setTimeout(r, 120_000));
+  const cancel = new Promise<void>(r => setTimeout(r, 1_200_000));
   await Promise.race([
     (async () => {
       try {
@@ -3374,7 +3374,7 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
         system: systemPrompt,
         messages: [{ role: "user", content: rawPrompt }],
       }),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(1_200_000),
     });
     if (!resp.ok) {
       const txt = await resp.text().catch(() => "");
@@ -3396,10 +3396,10 @@ async function routeApiEnrichPrompt(req: Request, serverCwd: string): Promise<Re
           { role: "system", content: systemPrompt },
           { role: "user", content: rawPrompt },
         ],
-        max_tokens: 2000,
+        max_tokens: 4000,
         temperature: 0.3,
       }),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(1_200_000),
     });
     if (!resp.ok) {
       const txt = await resp.text().catch(() => "");
@@ -3478,7 +3478,7 @@ async function routeApiModels(req: Request): Promise<Response> {
   const base = url.replace(/\/+$/, "").replace(/\/v1$/, "");
   try {
     const resp = await fetch(`${base}/api/tags`, {
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(8000),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json() as { models?: Array<{ name: string }> };
